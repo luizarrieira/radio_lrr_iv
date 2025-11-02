@@ -1,0 +1,14 @@
+{
+  "name": "meu-radio",
+  "version": "1.0.0",
+  "description": "Rádio Web simples",
+  "scripts": {
+    "start": "serve ."
+  },
+  "devDependencies": {
+    "serve": "^14.2.0"
+  },
+  "dependencies": {
+    "music-metadata": "^11.9.0"
+  }
+}

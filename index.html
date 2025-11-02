@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Liberty Rock Radio</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@600&display=swap');
+    body {
+      margin: 0;
+      background: #0e0e0e;
+      color: #eee;
+      font-family: 'Orbitron', sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      user-select: none;
+    }
+    #capa {
+      width: 280px;
+      height: 280px;
+      object-fit: cover;
+      border-radius: 16px;
+      box-shadow: 0 0 25px rgba(255,255,255,0.15);
+      margin-bottom: 25px;
+      transition: transform 0.6s ease-in-out, box-shadow 0.4s ease;
+    }
+    #capa.playing {
+      transform: scale(1.05);
+      box-shadow: 0 0 35px rgba(0,255,255,0.25);
+    }
+    #btnStart {
+      padding: 14px 32px;
+      border: none;
+      border-radius: 8px;
+      background: #00ffff;
+      color: #000;
+      font-size: 20px;
+      cursor: pointer;
+      font-weight: bold;
+      transition: background 0.3s;
+    }
+    #btnStart:hover {
+      background: #00cccc;
+    }
+    #status {
+      margin-top: 16px;
+      font-size: 14px;
+      color: #aaa;
+      font-family: monospace;
+    }
+    #logArea {
+      margin-top: 20px;
+      width: 90%;
+      max-width: 600px;
+      height: 150px;
+      overflow-y: auto;
+      background: #111;
+      border: 1px solid #333;
+      padding: 8px;
+      border-radius: 6px;
+      font-family: monospace;
+      font-size: 12px;
+      color: #0f0;
+    }
+  </style>
+</head>
+<body>
+  <img id="capa" src="capas/default.jpg" alt="Capa da música atual" />
+  <button id="btnStart">▶ Iniciar Rádio</button>
+  <div id="status">Clique para iniciar a transmissão</div>
+  <div id="logArea"></div>
+
+  <script src="renderer.js"></script>
+  <script>
+    // --- Log visual adicional no index (mantém os logs de console) ---
+    const logArea = document.getElementById('logArea');
+    const capa = document.getElementById('capa');
+    const statusEl = document.getElementById('status');
+    const oldLog = console.log;
+    console.log = (...args) => {
+      oldLog(...args);
+      const line = document.createElement('div');
+      line.textContent = args.join(' ');
+      logArea.appendChild(line);
+      logArea.scrollTop = logArea.scrollHeight;
+    };
+    document.getElementById('btnStart').addEventListener('click', () => {
+      statusEl.textContent = '🎧 Rádio ao vivo...';
+      capa.classList.add('playing');
+    });
+  </script>
+</body>
+</html>
