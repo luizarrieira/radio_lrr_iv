@@ -541,20 +541,6 @@ async function chooseInitialSequenceAndPreload(){
   return seq; // return chosen sequence so start function can use same sequence (important!)
 }
 
-/* ================= MAIN SEQUENCE RUNNER (sequential) ================= */
-/* The loop will be started after initial preload & first sequence executed.
-   It chooses sequences by weight and plays them. */
-const sequencePool = [
-  {k:'id+musica', w:3},
-  {k:'djsolo+musica', w:3},
-  {k:'musica', w:3},
-  {k:'adv+musica', w:1},
-  {k:'adv+id+musica', w:1},
-  {k:'id+djsolo+musica', w:1}
-];
-
-function pickSequenceWeighted(){ return weightedPick(sequencePool); }
-
 async function mainSequenceRunner(){
   try{
     const seq = pickSequenceWeighted();
