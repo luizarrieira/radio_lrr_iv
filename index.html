@@ -24,7 +24,7 @@
       object-fit: cover;
       border-radius: 16px;
       box-shadow: 0 0 25px rgba(255,255,255,0.15);
-      margin-bottom: 25px;
+      margin-bottom: 12px;
       transition: transform 0.6s ease-in-out, box-shadow 0.4s ease;
     }
     #capa.playing {
@@ -41,21 +41,15 @@
       cursor: pointer;
       font-weight: bold;
       transition: background 0.3s;
+      margin-bottom: 8px;
     }
-    #btnStart:hover {
-      background: #00cccc;
-    }
-    #status {
-      margin-top: 16px;
-      font-size: 14px;
-      color: #aaa;
-      font-family: monospace;
-    }
+    #btnStart:hover { background: #00cccc; }
+    #status { margin-top: 8px; font-size: 14px; color: #aaa; font-family: monospace; }
     #logArea {
-      margin-top: 20px;
+      margin-top: 12px;
       width: 90%;
       max-width: 600px;
-      height: 150px;
+      height: 120px;
       overflow-y: auto;
       background: #111;
       border: 1px solid #333;
@@ -65,6 +59,33 @@
       font-size: 12px;
       color: #0f0;
     }
+
+    /* Program selector thumbnails */
+    #programs {
+      margin-top: 12px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: center;
+    }
+    .prog-thumb {
+      width: 72px;
+      height: 72px;
+      object-fit: cover;
+      border-radius: 8px;
+      border: 2px solid rgba(255,255,255,0.06);
+      box-shadow: 0 0 8px rgba(0,0,0,0.6);
+      cursor: pointer;
+      transition: transform .18s, box-shadow .18s, border-color .18s;
+    }
+    .prog-thumb:hover { transform: translateY(-3px); }
+    .prog-thumb.active {
+      border-color: #00ffff;
+      box-shadow: 0 0 18px rgba(0,255,255,0.18);
+    }
+    .prog-label { font-size: 11px; color: #bbb; text-align: center; margin-top: 4px; }
+
+    .prog-wrap { display:flex; flex-direction:column; align-items:center; gap:4px; }
   </style>
 </head>
 <body>
@@ -72,6 +93,21 @@
   <button id="btnStart">▶ Iniciar Rádio</button>
   <div id="status">Clique para iniciar a transmissão</div>
   <div id="logArea"></div>
+
+  <div id="programs" aria-label="Seleção de Programações">
+    <div class="prog-wrap">
+      <img id="prog_ivbase" class="prog-thumb active" src="capas/thumb_ivbase.jpg" alt="IVBase" />
+      <div class="prog-label">ivbase</div>
+    </div>
+    <div class="prog-wrap">
+      <img id="prog_tlad" class="prog-thumb" src="capas/thumb_tlad.jpg" alt="TLAD" />
+      <div class="prog-label">tlad</div>
+    </div>
+    <div class="prog-wrap">
+      <img id="prog_ivtlad" class="prog-thumb" src="capas/thumb_ivtlad.jpg" alt="IV+TLAD" />
+      <div class="prog-label">ivtlad</div>
+    </div>
+  </div>
 
   <script src="renderer.js"></script>
   <script>
@@ -87,10 +123,34 @@
       logArea.appendChild(line);
       logArea.scrollTop = logArea.scrollHeight;
     };
+
     document.getElementById('btnStart').addEventListener('click', () => {
       statusEl.textContent = '🎧 Rádio ao vivo...';
       capa.classList.add('playing');
+      window.__RADIO?.startRadio?.();
     });
+
+    // program selector hooks
+    function setActiveThumb(name){
+      ['ivbase','tlad','ivtlad'].forEach(k=>{
+        const el = document.getElementById('prog_'+k);
+        if(!el) return;
+        if(k===name) el.classList.add('active'); else el.classList.remove('active');
+      });
+    }
+    document.getElementById('prog_ivbase').addEventListener('click', ()=>{
+      setActiveThumb('ivbase');
+      window.__RADIO?.setProgramacao('ivbase');
+    });
+    document.getElementById('prog_tlad').addEventListener('click', ()=>{
+      setActiveThumb('tlad');
+      window.__RADIO?.setProgramacao('tlad');
+    });
+    document.getElementById('prog_ivtlad').addEventListener('click', ()=>{
+      setActiveThumb('ivtlad');
+      window.__RADIO?.setProgramacao('ivtlad');
+    });
+
   </script>
 </body>
 </html>
