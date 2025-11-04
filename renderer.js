@@ -898,6 +898,18 @@ async function startRadio(){
   started = true;
   log('Starting radio (JIT mode v3)');
 
+  // *** ADIÇÃO DO "TRUQUE" DE ÁUDIO SILENCIOSO ***
+  try {
+    const keepAliveAudio = document.getElementById('audioKeepAlive');
+    if (keepAliveAudio) {
+      await keepAliveAudio.play();
+      log('Áudio "Keep Alive" iniciado para tentar manter o app rodando.');
+    }
+  } catch (e) {
+    console.warn('Falha ao iniciar áudio "Keep Alive". O celular pode parar o áudio.', e);
+  }
+  // *** FIM DA ADIÇÃO ***
+
   if(audioCtx.state === 'suspended') await audioCtx.resume();
   
   // *** NOVA ADIÇÃO (Media Session) ***
