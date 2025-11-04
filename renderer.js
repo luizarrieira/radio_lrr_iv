@@ -1,5 +1,5 @@
-// renderer.js — Versão otimizada JIT (v2)
-// Corrige lógica de ENDTO e torna a troca de programa imediata.
+// renderer.js — Versão otimizada JIT (v3)
+// Corrige o "stall" na troca de programa e adiciona Media Session API.
 
 /* =================== AudioContext / Constants =================== */
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -234,7 +234,6 @@ const PROGRAMACOES = {
 
 /* =================== Active program state & queues =================== */
 let currentProgram = 'ivbase';
-// let pendingProgram = null; // Removido, a troca agora é imediata
 let ativo = PROGRAMACOES[currentProgram];
 
 let musicQueue = [];
@@ -261,15 +260,12 @@ async function loadDuracoesJSON(){
   }
 }
 
-/* =================== Audio buffer fetch (JIT version) ===================
-   Agora inclui uma verificação de token para cancelar o carregamento se o programa mudar.
-*/
+/* =================== Audio buffer fetch (JIT version) =================== */
 async function getAudioBuffer(path, token = null){
   // 1. Retorna do cache se existir
   if(audioBufferCache.has(path)) return audioBufferCache.get(path);
   
   // 2. Verifica o token antes de buscar (otimização)
-  // Se um token foi passado e não é o token ativo, cancela.
   if(token && token !== activePreloadToken) {
     throw new Error(`Preload token stale for ${path}. Active: ${activePreloadToken}, Got: ${token}`);
   }
@@ -280,7 +276,6 @@ async function getAudioBuffer(path, token = null){
     const ab = await resp.arrayBuffer();
     
     // 3. Verifica o token *depois* de buscar, antes de decodificar
-    // (A troca pode ter ocorrido durante o download)
     if(token && token !== activePreloadToken) {
       throw new Error(`Preload token stale after fetch ${path}. Active: ${activePreloadToken}, Got: ${token}`);
     }
@@ -324,7 +319,6 @@ function onNarrationStart(){
   musicGain.gain.cancelScheduledValues(now);
   musicGain.gain.setValueAtTime(musicGain.gain.value, now);
   musicGain.gain.linearRampToValueAtTime(DUCK_TARGET, now + DUCK_DOWN_TIME);
-  // log('Narration start -> duck to', DUCK_TARGET); // (reduzindo log)
 }
 function onNarrationEnd(){
   activeNarrationsCount = Math.max(0, activeNarrationsCount-1);
@@ -335,7 +329,6 @@ function onNarrationEnd(){
       musicGain.gain.setValueAtTime(musicGain.gain.value, now);
       musicGain.gain.linearRampToValueAtTime(1.0, now + DUCK_UP_TIME);
       duckReleaseTimeout = null;
-      // log('Narration end -> release duck to 1.0'); // (reduzindo log)
     }, DUCK_RELEASE_DELAY_MS);
   }
 }
@@ -415,7 +408,6 @@ async function scheduleNarrationToEndAt(musicStartAudioTime, zoneStartMs, zoneEn
   const startAudioTime = musicStartAudioTime + startOffsetSec;
 
   try{
-    // O buffer JÁ DEVE ESTAR EM CACHE por causa do 'prepareNextSequence'
     const buf = await getAudioBuffer(candidatePath); // Pega do cache
     const src = audioCtx.createBufferSource();
     src.buffer = buf; src.connect(narrationGain);
@@ -437,7 +429,6 @@ async function scheduleNarrationToEndAt(musicStartAudioTime, zoneStartMs, zoneEn
         resolve({path:candidatePath, meta});
       };
     });
-    // log('Scheduled narration', candidatePath, 'startAudioTime', startAudioTime.toFixed(3));
     return {scheduled:true, promise:p, chosen:candidatePath, dur:durMs, meta};
   }catch(e){
     console.warn('scheduleNarrationToEndAt failed', candidatePath, e);
@@ -450,8 +441,7 @@ async function playNarrationImmediate(path){
   if(!path) return;
   updateCover(DEFAULT_COVER);
   try{
-    // O buffer JÁ DEVE ESTAR EM CACHE
-    const buf = await getAudioBuffer(path);
+    const buf = await getAudioBuffer(path); // Pega do cache
     onNarrationStart();
     await playBufferToNarrationGain(buf);
     onNarrationEnd();
@@ -473,52 +463,39 @@ function pickSequenceWeighted(){ return weightedPick(sequencePool); }
 
 
 /* ================================================================= */
-/* =================== NOVA ARQUITETURA DE SEQUÊNCIA (v2) =================== */
+/* =================== ARQUITETURA DE SEQUÊNCIA (v3) =================== */
 /* ================================================================= */
 
 /**
- * (NOVO) Resolve qual narração será usada para uma zona (intro/final).
- * Esta função apenas *decide* e *seleciona* o arquivo, não o agenda.
- * Retorna: { path: '...', dur: 1234, subgroup: 'toad' | null } ou null
+ * Resolve qual narração será usada para uma zona (intro/final).
  */
 function resolveNarrationForZone(musicObj, zoneType) {
   const isIntro = zoneType === 'intro';
   const zoneStart = isIntro ? musicObj.introStart : musicObj.finalStart;
   const zoneEnd = isIntro ? musicObj.introEnd : musicObj.finalEnd;
 
-  if (zoneStart == null || zoneEnd == null) {
-    // log(isIntro ? 'Intro' : 'Final', 'zone absent for', musicObj.name);
-    return null; // Sem zona
-  }
-  
-  if (!chance(0.7)) {
-    // log(isIntro ? 'Intro' : 'Final', 'skipped by chance for', musicObj.name);
-    return null; // Sorteado para não ter narração
-  }
+  if (zoneStart == null || zoneEnd == null) return null;
+  if (!chance(0.7)) return null;
 
   const zoneLen = zoneEnd - zoneStart;
   const r = Math.random();
 
   if (isIntro) {
-    // Lógica de INTRO
     if (r < 0.4) {
       const pool = ativo.narracoesGeneral || [];
       const chosen = chooseRandomCandidateThatFits(pool, zoneLen);
       if(chosen) return { ...chosen, subgroup: null };
-      // log('Intro: no general candidate fits for', musicObj.name);
     } else if (r < 0.8) {
       const pool = ativo.musicIntroNarrations && ativo.musicIntroNarrations[musicObj.name] ? ativo.musicIntroNarrations[musicObj.name] : [];
       if (pool.length > 0) {
         const chosen = chooseRandomCandidateThatFits(pool, zoneLen);
         if(chosen) return { ...chosen, subgroup: null };
-        // log('Intro: none music-specific fit for', musicObj.name);
       }
     } else {
       const timePath = pickTimeNarration();
       if (timePath) {
         const chosen = chooseRandomCandidateThatFits([timePath], zoneLen);
         if(chosen) return { ...chosen, subgroup: null };
-        // log('Intro: time narration too long for', musicObj.name);
       }
     }
   } else {
@@ -527,22 +504,19 @@ function resolveNarrationForZone(musicObj, zoneType) {
       const pool = ativo.narracoesGeneral || [];
       const chosen = chooseRandomCandidateThatFits(pool, zoneLen);
       if(chosen) return { ...chosen, subgroup: null };
-      // log('Final: no general candidate fits for', musicObj.name);
     } else {
       // É um ENDTO
       const pick = weightedPick([{k:'toad',w:3},{k:'tonews',w:2},{k:'towheather',w:1}]);
       const pool = (ativo.endto && ativo.endto[pick]) ? ativo.endto[pick] : [];
       const chosen = chooseRandomCandidateThatFits(pool, zoneLen);
       if(chosen) return { ...chosen, subgroup: pick }; // Retorna o subgroup!
-      // log('Final: no ENDTO candidate fits for', musicObj.name, 'subgroup', pick);
     }
   }
-  
-  return null; // Nenhuma narração encontrada ou coube
+  return null;
 }
 
 /**
- * (NOVO) Prepara a *próxima* sequência.
+ * Prepara a *próxima* sequência.
  * Resolve todos os arquivos aleatórios, e carrega-os na memória.
  */
 async function prepareNextSequence(token) {
@@ -552,7 +526,6 @@ async function prepareNextSequence(token) {
   }
   isPreloadingNext = true;
   
-  // *** CORREÇÃO ENDTO ***
   // O 'currentFollowupHint' é usado AQUI para decidir o tipo de sequência.
   log(`Preparando próxima sequência... (Token: ${token}, Hint: ${currentFollowupHint}, Prog: ${currentProgram})`);
 
@@ -573,7 +546,6 @@ async function prepareNextSequence(token) {
 
   try {
     // 1. Decidir o TIPO de sequência
-    // Se a *última* sequência disparou um ENDTO, forçamos a sequência de followup
     if (currentFollowupHint === 'toad') {
       seqType = chance(0.5) ? 'adv+musica' : 'adv+id+musica';
     } else if (currentFollowupHint === 'tonews') {
@@ -581,15 +553,12 @@ async function prepareNextSequence(token) {
     } else if (currentFollowupHint === 'towheather') {
       seqType = chance(0.5) ? 'weather+musica' : 'weather+id+musica';
     } else {
-      // Padrão
       seqType = pickSequenceWeighted();
     }
     job.type = seqType;
     log('Sequência resolvida:', seqType);
 
     // 2. Resolver os arquivos para esse tipo
-    // (Lógica baseada nos blocos 'case' da função antiga)
-    
     if (seqType.includes('id')) {
       job.id = await nextID();
       if(job.id) filesToLoad.add(job.id);
@@ -611,16 +580,12 @@ async function prepareNextSequence(token) {
       if(job.weather) filesToLoad.add(job.weather);
     }
 
-    // Resolver música e suas narrações (quase sempre presente)
     if (seqType.includes('musica')) {
       job.music = await nextMusic();
       if (job.music && job.music.arquivo) {
         filesToLoad.add(job.music.arquivo);
-        
-        // Resolver narrações para a música
         job.narrations.intro = resolveNarrationForZone(job.music, 'intro');
         if(job.narrations.intro) filesToLoad.add(job.narrations.intro.path);
-
         job.narrations.final = resolveNarrationForZone(job.music, 'final');
         if(job.narrations.final) {
           filesToLoad.add(job.narrations.final.path);
@@ -646,7 +611,6 @@ async function prepareNextSequence(token) {
     }
     
   } catch (e) {
-    // Erros de token "stale" são esperados
     if (String(e.message).includes('stale')) {
       log('Preparação da sequência cancelada pela troca de token.');
     } else {
@@ -659,8 +623,8 @@ async function prepareNextSequence(token) {
 }
 
 /**
- * (NOVO) Toca uma música e agenda as narrações que JÁ FORAM RESOLVIDAS.
- * Versão simplificada de 'playMusicWithNarrations'
+ * Toca uma música e agenda as narrações que JÁ FORAM RESOLVIDAS.
+ * *** MODIFICADO com Media Session ***
  */
 async function playMusicWithResolvedNarrations(musicObj, introNarration, finalNarration) {
   if (!musicObj) {
@@ -671,13 +635,28 @@ async function playMusicWithResolvedNarrations(musicObj, introNarration, finalNa
   log('Now playing track:', musicObj.name, 'program', ativo.key);
   updateCover(musicObj.capa || DEFAULT_COVER, true);
 
+  // *** NOVA ADIÇÃO (Media Session) ***
+  // Atualiza os metadados da tela de bloqueio
+  if ('mediaSession' in navigator) {
+    // Garante que o caminho da capa seja absoluto
+    const absoluteCoverSrc = new URL(musicObj.capa || DEFAULT_COVER, window.location.href).href;
+    
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: musicObj.name || 'Liberty Rock',
+      artist: 'Liberty Rock Radio',
+      album: 'Artistas Variados',
+      artwork: [ { src: absoluteCoverSrc, sizes: '280x280', type: 'image/jpeg' } ]
+    });
+    navigator.mediaSession.playbackState = "playing";
+  }
+  // *** FIM DA ADIÇÃO ***
+
   const musicBuf = await getAudioBuffer(musicObj.arquivo); // Pega do cache
   const musicSrc = audioCtx.createBufferSource();
   musicSrc.buffer = musicBuf;
   musicSrc.connect(musicGain);
   const musicStartAudioTime = audioCtx.currentTime;
   musicSrc.start(musicStartAudioTime);
-  // log('Music started at audioTime', musicStartAudioTime.toFixed(3));
 
   const scheduledPromises = [];
 
@@ -707,6 +686,21 @@ async function playMusicWithResolvedNarrations(musicObj, introNarration, finalNa
   await new Promise(resolve => musicSrc.onended = resolve);
   log('Music ended:', musicObj.name);
 
+  // *** NOVA ADIÇÃO (Media Session) ***
+  // Volta os metadados para o padrão da rádio (mostra que está "Entre Músicas")
+  if ('mediaSession' in navigator) {
+     const defaultCoverSrc = new URL(DEFAULT_COVER, window.location.href).href;
+     navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'Transmissão Ao Vivo',
+        artist: 'Liberty Rock Radio',
+        album: 'Liberty Rock Radio',
+        artwork: [ { src: defaultCoverSrc, sizes: '280x280', type: 'image/jpeg' } ]
+     });
+     // Mantém o estado como "playing" pois a rádio continua
+     navigator.mediaSession.playbackState = "playing"; 
+  }
+  // *** FIM DA ADIÇÃO ***
+
   // Esperar narrações agendadas terminarem
   if (scheduledPromises.length > 0) {
     try { await Promise.all(scheduledPromises); } catch (e) { console.warn('Error waiting scheduled narrs', e); }
@@ -716,21 +710,18 @@ async function playMusicWithResolvedNarrations(musicObj, introNarration, finalNa
 }
 
 /**
- * (NOVO) Executa o trabalho da sequência que JÁ ESTÁ EM CACHE.
+ * Executa o trabalho da sequência que JÁ ESTÁ EM CACHE.
  */
 async function executeSequence(job) {
   log('Executando sequência:', job.type);
   
   try {
-    // 1. Tocar blocos de "interrupção" (News, Weather)
     if (job.news) {
       await playNarrationImmediate(job.news);
     }
     if (job.weather) {
       await playNarrationImmediate(job.weather);
     }
-
-    // 2. Tocar blocos pré-música (ADV, ID, DJSolo)
     if (job.adv) {
       log('Playing ADV', job.adv);
       updateCover(DEFAULT_COVER);
@@ -746,8 +737,6 @@ async function executeSequence(job) {
       updateCover(DEFAULT_COVER);
       await playBufferToDestination(await getAudioBuffer(job.djsolo));
     }
-
-    // 3. Tocar a música principal (com suas narrações internas)
     if (job.music) {
       await playMusicWithResolvedNarrations(
         job.music,
@@ -755,14 +744,8 @@ async function executeSequence(job) {
         job.narrations.final
       );
     }
-    
-    // *** CORREÇÃO ENDTO ***
-    // A definição do HINT foi MOVIDA para o mainSequenceRunner
-    // currentFollowupHint = job.endtoTrigger || null; // <--- LINHA REMOVIDA
-    
   } catch (e) {
     console.error('Erro ao executar sequência:', job.type, e);
-    // currentFollowupHint = null; // Reseta o hint em caso de erro (movido tbm)
   }
   
   log('Sequência finalizada:', job.type);
@@ -771,67 +754,66 @@ async function executeSequence(job) {
 
 /**
  * (MODIFICADO) Loop principal da rádio.
- * Lógica de ENDTO e troca de programa corrigidas.
+ * Lógica v3 para suportar troca de programa sem "stall".
  */
 async function mainSequenceRunner() {
-  log('Main sequence runner iniciado.');
+  log('Main sequence runner iniciado (v3).');
   
+  // 1. Carrega a *primeira* sequência. Este é o único "await" de preload no loop principal.
+  log('Preparando a primeira sequência...');
+  await prepareNextSequence(activePreloadToken);
+  if (!nextSequenceJob) {
+    log('Falha ao carregar primeira sequência. Parando.');
+    started = false;
+    document.getElementById('status').textContent = 'Erro ao carregar. Tente reiniciar.';
+    return;
+  }
+
   while (started) {
     try {
-      // 1. *** CORREÇÃO PROGRAM CHANGE ***
-      // A troca de programa (chamada por setProgramacao) agora é imediata
-      // e cancela 'nextSequenceJob' e 'isPreloadingNext'.
-      // Não precisamos mais checar 'pendingProgram' aqui.
-
-      // 2. Garantir que a *próxima* sequência esteja pronta
+      // 2. Verifica se a próxima sequência está pronta.
+      // (Ela deveria estar, *a menos que* uma troca de programa
+      // tenha acabado de acontecer e o novo preload ainda não terminou).
       if (!nextSequenceJob) {
-        if (isPreloadingNext) {
-          log('Aguardando preload (provavelmente sendo cancelado) terminar...');
-          while (isPreloadingNext && !nextSequenceJob) {
-            await sleep(100);
-          }
-        } 
+        log('Aguardando preload (pós-mudança de programa) terminar...');
+        while (isPreloadingNext && !nextSequenceJob) {
+          await sleep(100);
+        }
         
-        // Se 'nextSequenceJob' ainda é nulo (ou foi cancelado), preparar um novo.
+        // Se *ainda* não estiver pronto (preload falhou), aciona um novo.
         if (!nextSequenceJob) {
-          log('Próxima sequência não está pronta. Preparando agora...');
-          // 'prepareNextSequence' usará o 'currentFollowupHint' (se houver)
-          // e o 'ativo' (programa) que estiverem vigentes *agora*.
-          await prepareNextSequence(activePreloadToken);
+          log('Preload falhou! Tentando carregar de novo (haverá silêncio)...');
+          await prepareNextSequence(activePreloadToken); // Este é um "await" de emergência
+          if (!nextSequenceJob) {
+            log('Falha catastrófica no preload. Reiniciando loop.');
+            await sleep(1000);
+            continue;
+          }
         }
       }
 
-      // 3. Se ainda assim falhar (ex: token mudou bem na hora), tentar de novo
-      if (!nextSequenceJob) {
-        log('Preparação da sequência falhou ou foi cancelada. Reiniciando loop.');
-        await sleep(50);
-        continue; // Volta ao início do loop
-      }
-
-      // 4. *** CORREÇÃO ENDTO ***
-      // Definir o HINT para o *próximo* preload (que vai rodar em background)
-      // baseado no resultado do preload que *acabou de terminar*.
+      // 3. Define o HINT para o *próximo* preload (baseado no job que *acabou de carregar*)
       currentFollowupHint = nextSequenceJob.endtoTrigger || null;
       log(`Hint para a próxima sequência definido para: ${currentFollowupHint}`);
       
-      // 5. Temos um trabalho. Mover para "current" e limpar "next"
+      // 4. Move o job carregado para "currentJob" e limpa "nextJob"
       const currentJob = nextSequenceJob;
       nextSequenceJob = null;
       
-      // 6. Iniciar o preload da *próxima* sequência (em background)
-      // Este 'prepareNextSequence' usará o 'currentFollowupHint' que acabamos de definir.
+      // 5. Aciona o preload da *próxima* sequência (em background)
+      // Isso roda *enquanto* a 'currentJob' está tocando.
       prepareNextSequence(activePreloadToken).catch(e => {
         if (!String(e.message).includes('stale')) {
            console.error('Erro no preload em background:', e);
         }
       });
       
-      // 7. Executar o trabalho atual (e aguardar)
+      // 6. Executa a sequência atual (e espera ela terminar)
       await executeSequence(currentJob);
 
     } catch (e) {
       console.error('Erro crítico no mainSequenceRunner:', e);
-      await sleep(1000); // Pausa antes de tentar de novo
+      await sleep(1000);
     }
   }
 }
@@ -839,8 +821,8 @@ async function mainSequenceRunner() {
 /* =================== Gerenciamento de Programa =================== */
 
 /**
- * (MODIFICADO) Aplica a mudança de programa pendente.
- * Agora é imediata e cancela o preload em andamento.
+ * (MODIFICADO) Aplica a mudança de programa.
+ * Agora é imediata e aciona o próximo preload em background.
  */
 function setProgramacao(name){
   if(!PROGRAMACOES[name]) { 
@@ -864,26 +846,32 @@ function setProgramacao(name){
   log('Program switched to', currentProgram, 'from', prevProgram);
 
   // **** CRÍTICO: Cancelar qualquer preload em andamento ****
-  // Ao incrementar o token, qualquer 'getAudioBuffer' ou 'prepareNextSequence'
-  // em andamento com o token antigo irá falhar ou ser descartado.
   preloadTokenCounter++;
   activePreloadToken = preloadTokenCounter;
   log('Novo token de preload ativo:', activePreloadToken);
   
-  // Limpar o trabalho da próxima sequência (não é mais válido)
+  // Limpa o trabalho da próxima sequência (não é mais válido)
   if (nextSequenceJob) {
     log('Descartando sequência pré-carregada do programa anterior.');
     nextSequenceJob = null;
   }
+  
   if (isPreloadingNext) {
      log('Sinalizando cancelamento de preload em andamento...');
-     isPreloadingNext = false; // Permite que o novo preload comece no loop
+     // O token fará o preload em andamento falhar.
+     // isPreloadingNext será resetado para 'false' por esse preload.
   }
   
-  // O mainSequenceRunner, ao terminar a música atual, verá
-  // 'nextSequenceJob' como nulo e chamará 'prepareNextSequence'.
-  // Esta chamada usará o *novo* 'ativo' e o *novo* 'activePreloadToken',
-  // e respeitará o 'currentFollowupHint' (ENDTO) que estiver no ar.
+  // *** A CORREÇÃO (v3) ***
+  // Aciona o preload para o *novo* programa *imediatamente* em background.
+  // O mainSequenceRunner vai esperar por este job no próximo loop,
+  // *depois* que a música atual (que já está em cache) terminar.
+  log('Acionando preload para o novo programa em background...');
+  prepareNextSequence(activePreloadToken).catch(e => {
+      if (!String(e.message).includes('stale')) {
+         console.warn('Preload pós-troca falhou:', e);
+      }
+  });
 }
 
 window.__RADIO = window.__RADIO || {};
@@ -892,29 +880,53 @@ window.__RADIO.setProgramacao = setProgramacao;
 
 /* =================== Initialization & start =================== */
 
-/**
- * (MODIFICADO) Init
- * Muito mais leve. Apenas carrega o JSON e o clima.
- */
 async function init(){
   await loadDuracoesJSON();
   await fetchWeather();
   ativo = PROGRAMACOES[currentProgram];
   resetMusicQueue();
   resetIDAdvQueues();
-  log('Init complete — JIT mode v2 ready (program)', currentProgram);
+  log('Init complete — JIT mode v3 ready (program)', currentProgram);
 }
 
 /**
  * (MODIFICADO) Start Radio
- * Apenas inicia o loop principal.
+ * Adiciona Media Session e chama o novo loop principal (v3).
  */
 async function startRadio(){
   if(started) return;
   started = true;
-  log('Starting radio (JIT mode v2)');
+  log('Starting radio (JIT mode v3)');
 
   if(audioCtx.state === 'suspended') await audioCtx.resume();
+  
+  // *** NOVA ADIÇÃO (Media Session) ***
+  if ('mediaSession' in navigator) {
+     log('Registrando Media Session Handlers...');
+     
+     navigator.mediaSession.setActionHandler('play', () => {
+        log('Media Session: Play');
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        navigator.mediaSession.playbackState = "playing";
+     });
+
+     navigator.mediaSession.setActionHandler('pause', () => {
+        log('Media Session: Pause');
+        if (audioCtx.state === 'running') audioCtx.suspend();
+        navigator.mediaSession.playbackState = "paused";
+     });
+
+     // Inicializa com os metadados padrão
+     const defaultCoverSrc = new URL(DEFAULT_COVER, window.location.href).href;
+     navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'Clique em Iniciar',
+        artist: 'Liberty Rock Radio',
+        album: 'Liberty Rock Radio',
+        artwork: [ { src: defaultCoverSrc, sizes: '280x280', type: 'image/jpeg' } ]
+     });
+     navigator.mediaSession.playbackState = "playing";
+  }
+  // *** FIM DA ADIÇÃO ***
   
   // Garantir que o init rodou
   if(Object.keys(duracoesNarracoes).length === 0) {
@@ -924,9 +936,7 @@ async function startRadio(){
     log('Init já concluído.');
   }
 
-  // Apenas inicia o loop.
-  // O loop vai verificar que 'nextSequenceJob' é nulo
-  // e vai chamar 'prepareNextSequence' pela primeira vez.
+  // Aciona o loop principal (v3)
   mainSequenceRunner().catch(e=>console.error('Erro ao iniciar mainSequenceRunner', e));
 }
 
@@ -939,4 +949,4 @@ window.__RADIO.loadDuracoesJSON = loadDuracoesJSON;
 window.__RADIO.duracoesNarracoes = () => duracoesNarracoes;
 
 init().catch(e=>console.error('init error', e));
-log('renderer.js loaded (JIT mode v2) — manual start via btnStart');
+log('renderer.js loaded (JIT mode v3 + MediaSession) — manual start via btnStart');
