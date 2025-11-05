@@ -1,19 +1,9 @@
-// renderer.js - Versão final (completo)
-// - Usa todas as pools/arquivos do renderer original enviado pelo usuário
-// - Pré-carregamento sequencial (current -> preload next when current starts -> wait if next not fully loaded)
-// - Trocas de programação aplicadas only after current sequence ends (respects endto and 30s rule)
-// - Touchstart unlock for iOS + resume on start button click for mobile compatibility
-// - Capas atualizadas when music actually starts
-// - 70% chance for intro and final narrations (as requested)
-// - Detailed logs
+// renderer.js — Versão otimizada JIT (v2)
+// Corrige lógica de ENDTO e torna a troca de programa imediata.
 
-/* =================== AudioContext / nodes =================== */
+/* =================== AudioContext / Constants =================== */
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 const audioCtx = new AudioContextClass();
-
-// Expose audioCtx for debug / external resume if needed
-window.__RADIO = window.__RADIO || {};
-window.__RADIO.audioCtx = audioCtx;
 
 const DUCK_TARGET = 0.5;
 const DUCK_DOWN_TIME = 0.1;
@@ -21,42 +11,34 @@ const DUCK_UP_TIME = 0.1;
 const DUCK_RELEASE_DELAY_MS = 200;
 const DEFAULT_COVER = 'capas/default.jpg';
 
-/* Gains */
+/* =================== Gains / Analyser =================== */
 const musicGain = audioCtx.createGain(); musicGain.gain.value = 1.0; musicGain.connect(audioCtx.destination);
 const narrationGain = audioCtx.createGain(); narrationGain.connect(audioCtx.destination);
 const analyser = audioCtx.createAnalyser(); analyser.fftSize = 512; analyser.smoothingTimeConstant = 0.85;
 narrationGain.connect(analyser);
 
-/* =================== State & caches =================== */
+/* =================== State & Cache =================== */
 const audioBufferCache = new Map(); // path -> AudioBuffer
 let duracoesNarracoes = {};
-let currentCover = DEFAULT_COVER;
-
-/* Sequence & radio control tokens */
-let sequenceLoopRunning = false;
-let sequenceLoopToken = 0;
-
-const radioState = {
-  started: false,           // start button clicked?
-  running: false,           // loop running
-  currentProgram: 'ivbase', // program playing
-  nextProgram: null,        // requested next program
-  changingProgram: false,   // swap is pending
-  preparingNext: false,     // currently preloading next sequence
-  preloadToken: 0           // token to invalidate preloads
-};
-
-/* For ducking */
+let started = false;
 let activeNarrationsCount = 0;
 let duckReleaseTimeout = null;
+let currentCover = DEFAULT_COVER;
 
-/* =================== Utilities =================== */
+/* =================== JIT Preload State =================== */
+let preloadTokenCounter = 0; // Usado para cancelar preloads ao trocar de programa
+let activePreloadToken = 0;
+let nextSequenceJob = null; // Armazena o trabalho da *próxima* sequência (arquivos e metadados)
+let isPreloadingNext = false; // Flag para evitar preloads duplicados
+let currentFollowupHint = null; // Armazena o gatilho ENDTO (ex: 'toad')
+
+/* =================== Utils =================== */
 function pad(n, len=2){ return String(n).padStart(len, '0'); }
 function rand(arr){ return arr && arr.length ? arr[Math.floor(Math.random()*arr.length)] : null; }
 function chance(p){ return Math.random() < p; }
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-function log(...args){ console.log('[RADIO]', new Date().toISOString(), ...args); }
-function warn(...args){ console.warn('[RADIO]', new Date().toISOString(), ...args); }
+function log(...args){ console.log('[RADIO]', ...args); }
+
 function weightedPick(items){
   const total = items.reduce((s,i)=>s+i.w,0);
   let r = Math.random()*total;
@@ -64,132 +46,9 @@ function weightedPick(items){
   return items[0].k;
 }
 
-/* =================== Load durations JSON =================== */
-async function loadDuracoesJSON(){
-  try{
-    const resp = await fetch('duracoes_narracoes.json');
-    if(!resp.ok) throw new Error('duracoes json fetch failed ' + resp.status);
-    duracoesNarracoes = await resp.json();
-    log('duracoes_narracoes.json loaded entries:', Object.keys(duracoesNarracoes).length);
-  }catch(e){
-    warn('Failed to load duracoes_narracoes.json', e);
-    duracoesNarracoes = {};
-  }
-}
-loadDuracoesJSON();
-
-/* =================== getAudioBuffer with cache =================== */
-async function getAudioBuffer(path){
-  if(audioBufferCache.has(path)) return audioBufferCache.get(path);
-  log('[GET_BUFFER] fetching', path);
-  const resp = await fetch(path);
-  if(!resp.ok) throw new Error('fetch ' + resp.status + ' ' + path);
-  const ab = await resp.arrayBuffer();
-  const buf = await audioCtx.decodeAudioData(ab);
-  audioBufferCache.set(path, buf);
-  log('[GET_BUFFER] decoded & cached', path);
-  return buf;
-}
-
-/* =================== Playback helpers =================== */
-async function playBufferToDestination(buf){
-  return new Promise(resolve => {
-    const src = audioCtx.createBufferSource(); src.buffer = buf; src.connect(audioCtx.destination);
-    src.onended = () => resolve();
-    src.start();
-  });
-}
-async function playBufferToNarrationGain(buf){
-  return new Promise(resolve => {
-    const src = audioCtx.createBufferSource(); src.buffer = buf; src.connect(narrationGain);
-    src.onended = () => resolve();
-    src.start();
-  });
-}
-
-/* =================== Ducking =================== */
-function onNarrationStart(){
-  activeNarrationsCount++;
-  if(duckReleaseTimeout){ clearTimeout(duckReleaseTimeout); duckReleaseTimeout = null; }
-  const now = audioCtx.currentTime;
-  musicGain.gain.cancelScheduledValues(now);
-  musicGain.gain.setValueAtTime(musicGain.gain.value, now);
-  musicGain.gain.linearRampToValueAtTime(DUCK_TARGET, now + DUCK_DOWN_TIME);
-  log('[DUCK] narration start - duck to', DUCK_TARGET, 'count', activeNarrationsCount);
-}
-function onNarrationEnd(){
-  activeNarrationsCount = Math.max(0, activeNarrationsCount-1);
-  log('[DUCK] narration end - remaining', activeNarrationsCount);
-  if(activeNarrationsCount === 0){
-    duckReleaseTimeout = setTimeout(() => {
-      const now = audioCtx.currentTime;
-      musicGain.gain.cancelScheduledValues(now);
-      musicGain.gain.setValueAtTime(musicGain.gain.value, now);
-      musicGain.gain.linearRampToValueAtTime(1.0, now + DUCK_UP_TIME);
-      duckReleaseTimeout = null;
-      log('[DUCK] released to 1.0');
-    }, DUCK_RELEASE_DELAY_MS);
-  }
-}
-
-/* =================== Cover update =================== */
-function updateCover(src = DEFAULT_COVER, force=false){
-  const el = document.getElementById('capa') || document.getElementById('cover');
-  if(!el) return;
-  const target = src || DEFAULT_COVER;
-  if(force || el.src.indexOf(target) === -1){
-    el.src = target;
-    currentCover = target;
-    log('[COVER] set to', target);
-  }
-}
-
-/* =================== Weather helpers =================== */
-let currentWeatherMain = 'Clear';
-async function fetchWeather(){
-  try{
-    const key = '0cad953b1e9b3793a944d644d5193d3a';
-    const resp = await fetch(`https://api.openweathermap.org/data/2.5/weather?q=Maringa,BR&appid=${key}`);
-    const j = await resp.json();
-    currentWeatherMain = j && j.weather && j.weather[0] && j.weather[0].main ? j.weather[0].main : 'Clear';
-    log('[WEATHER] current', currentWeatherMain);
-  }catch(e){
-    warn('[WEATHER] fetch failed', e);
-    currentWeatherMain = 'Clear';
-  }
-}
-fetchWeather();
-function pickWeatherFile(condition){
-  if(!condition) return null;
-  const c = String(condition).toLowerCase();
-  const h = new Date().getHours();
-  if(c.includes('cloud')) { const n=Math.floor(Math.random()*11)+1; return `weather/CLOUD_${pad(n,2)}.wav`; }
-  if(c.includes('fog')||c.includes('mist')) { const n=Math.floor(Math.random()*12)+1; return `weather/FOG_${pad(n,2)}.wav`; }
-  if(c.includes('rain')) { const n=Math.floor(Math.random()*11)+1; return `weather/RAIN_${pad(n,2)}.wav`; }
-  if((c.includes('clear') || c.includes('sun')) && h >= 5 && h <= 18) { const n=Math.floor(Math.random()*12)+1; return `weather/SUN_${pad(n,2)}.wav`; }
-  if(c.includes('wind')||c.includes('breeze')) { const n=Math.floor(Math.random()*11)+1; return `weather/WIND_${pad(n,2)}.wav`; }
-  return null;
-}
-
-/* =================== Candidate fit using duracoes_narracoes.json =================== */
-function filterCandidatesByZone(candidates, zoneLenMs){
-  if(!candidates || candidates.length===0) return [];
-  const out = [];
-  for(const p of candidates){
-    const parts = p.split('/'); const fname = parts[parts.length-1];
-    const d = duracoesNarracoes[fname];
-    if(typeof d === 'number' && d <= zoneLenMs) out.push({path:p,dur:d});
-  }
-  return out;
-}
-function chooseRandomCandidateThatFits(poolPaths, zoneLenMs){
-  const filtered = filterCandidatesByZone(poolPaths, zoneLenMs);
-  if(filtered.length===0) return null;
-  return filtered[Math.floor(Math.random()*filtered.length)];
-}
-
-/* =================== Pools (copied from original renderer) =================== */
-/* base musicasList */
+/* =================== --- BASE (IVBASE) pools --- */
+/* (Pools de arquivos OMITIDOS POR BREVIDADE - eles permanecem os mesmos) */
+/* base musicasList (existing) */
 const base_musicasList = [
   { id:'fascination', name:'FASCINATION', arquivo:'musicas/FASCINATION.wav', introStart:5581, introEnd:27563, finalStart:188733, finalEnd:216000, capa:'capas/fascination.jpg' },
   { id:'remedy', name:'REMEDY', arquivo:'musicas/REMEDY.wav', introStart:6020, introEnd:36138, finalStart:195886, finalEnd:222205, capa:'capas/remedy.jpg' },
@@ -215,6 +74,7 @@ const base_musicasList = [
   { id:'turnyouinsideout', name:'TURNYOUINSIDEOUT', arquivo:'musicas/TURNYOUINSIDEOUT.wav', introStart:3923, introEnd:21663, finalStart:167936, finalEnd:190086, capa:'capas/turnyouinsideout.jpg' }
 ];
 
+/* base groups */
 const base_narracoesGeneral = Array.from({length:25},(_,i)=>`narracoes/GENERAL_${pad(i+1,2)}.wav`);
 const base_grupoID = Array.from({length:12},(_,i)=>`narracoes/ID_${pad(i+1,2)}.wav`);
 const base_grupoDJSolo = Array.from({length:13},(_,i)=>`narracoes/SOLO_${pad(i+1,2)}.wav`);
@@ -248,11 +108,12 @@ const base_musicIntroNarrations = {
   'TURNYOUINSIDEOUT': ['narracoes/TURNYOUINSIDEOUT_01.wav']
 };
 
-/* TLAD / IVTLAD pools copied similarly */
+/* =================== --- TLAD pools (novos arquivos) --- */
+/* Musicas TLAD (todas as que você listou) */
 const tlad_musicasList = [
   { id:'chinagrove_ph', name:'CHINAGROVE_PH', arquivo:'musicas/CHINAGROVE_PH.wav', introStart:6316, introEnd:21472, finalStart:140333, finalEnd:173642, capa:'capas/chinagrove_ph.jpg' },
   { id:'deadoralive_ph', name:'DEADORALIVE_PH', arquivo:'musicas/DEADORALIVE_PH.wav', introStart:15000, introEnd:38946, finalStart:255000, finalEnd:282684, capa:'capas/deadoralive_ph.jpg' },
-  { id:'drivinwheel_ph', name:'DRIVINWHEEL_PH', arquivo:'musicas/DRIVINWHEEL_PH.wav', introStart:4650, introEnd:17955, finalStart:199989, finalEnd:221874, capa:'capas/drivinwheel_ph.jpg' },
+  { id:'drivinwheel_ph', name:'DRIVINWHELL_PH', arquivo:'musicas/DRIVINWHELL_PH.wav', introStart:4650, introEnd:17955, finalStart:199989, finalEnd:221874, capa:'capas/drivinwheel_ph.jpg' },
   { id:'everypicturetells_ph', name:'EVERYPICTURETELLS_PH', arquivo:'musicas/EVERYPICTURETELLS_PH.wav', introStart:3029, introEnd:16238, finalStart:285184, finalEnd:310061, capa:'capas/everypicturetells_ph.jpg' },
   { id:'fivetoone_ph', name:'FIVETOONE_PH', arquivo:'musicas/FIVETOONE_PH.wav', introStart:6925, introEnd:16933, finalStart:224675, finalEnd:248426, capa:'capas/fivetoone_ph.jpg' },
   { id:'freeride_ph', name:'FREERIDE_PH', arquivo:'musicas/FREERIDE_PH.wav', introStart:7082, introEnd:15488, finalStart:145106, finalEnd:162193, capa:'capas/freeride_ph.jpg' },
@@ -270,6 +131,7 @@ const tlad_musicasList = [
   { id:'wildside_ph', name:'WILDSIDE_PH', arquivo:'musicas/WILDSIDE_PH.wav', introStart:10206, introEnd:26080, finalStart:161655, finalEnd:186433, capa:'capas/wildside_ph.jpg' }
 ];
 
+/* TLAD narrations/pools based on your list */
 const tlad_narracoesGeneral = Array.from({length:17}, (_,i) => `narracoes/GENERAL_${pad(i+26,2)}.wav`);
 const tlad_timePools = {
   morning: ['narracoes/MORNING_06.wav','narracoes/MORNING_07.wav','narracoes/MORNING_08.wav'],
@@ -282,9 +144,13 @@ const tlad_endto = {
   tonews: ['narracoes/TO_NEWS_06.wav','narracoes/TO_NEWS_07.wav','narracoes/TO_NEWS_08.wav'],
   towheather: ['narracoes/TO_WEATHER_06.wav','narracoes/TO_WEATHER_07.wav','narracoes/TO_WEATHER_08.wav']
 };
+/* TLAD adv: AD001..AD093 but ivbase should not use AD084..AD093 */
 const tlad_grupoAdv = Array.from({length:93},(_,i)=>`adv/AD${pad(i+1,3)}.wav`);
 const tlad_grupoWeazelNews = Array.from({length:125},(_,i)=>`news/NEWS_${pad(i+1,2)}.wav`);
+// *** SUA ALTERAÇÃO APLICADA (SOLO_14 a SOLO_23) ***
 const tlad_grupoDJSolo = Array.from({length:10},(_,i)=>`narracoes/SOLO_${pad(i+14,2)}.wav`);
+
+/* TLAD music specific intro narrations (two each) */
 const tlad_musicIntroNarrations = {
   'CHINAGROVE_PH': ['narracoes/CHINAGROVE_PH_01.wav','narracoes/CHINAGROVE_PH_02.wav'],
   'DEADORALIVE_PH': ['narracoes/DEADORALIVE_PH_01.wav','narracoes/DEADORALIVE_PH_02.wav'],
@@ -306,6 +172,7 @@ const tlad_musicIntroNarrations = {
   'WILDSIDE_PH': ['narracoes/WILDSIDE_PH_01.wav','narracoes/WILDSIDE_PH_02.wav']
 };
 
+/* =================== IVTLAD (union) pools =================== */
 const ivtlad_musicasList = [...base_musicasList, ...tlad_musicasList];
 const ivtlad_narracoesGeneral = Array.from({length:42},(_,i)=>`narracoes/GENERAL_${pad(i+1,2)}.wav`);
 const ivtlad_timePools = {
@@ -321,263 +188,241 @@ const ivtlad_endto = {
 };
 const ivtlad_grupoAdv = Array.from({length:93},(_,i)=>`adv/AD${pad(i+1,3)}.wav`);
 const ivtlad_grupoWeazelNews = Array.from({length:125},(_,i)=>`news/NEWS_${pad(i+1,2)}.wav`);
+// IVTLAD usa todos os 23 solos
 const ivtlad_grupoDJSolo = Array.from({length:23},(_,i)=>`narracoes/SOLO_${pad(i+1,2)}.wav`);
 const ivtlad_musicIntroNarrations = {...base_musicIntroNarrations, ...tlad_musicIntroNarrations};
 
+/* =================== PROGRAMACOES object =================== */
 const PROGRAMACOES = {
   ivbase: {
-    key:'ivbase',
+    key: 'ivbase',
     musicasList: base_musicasList.slice(),
     narracoesGeneral: base_narracoesGeneral.slice(),
     timePools: JSON.parse(JSON.stringify(base_timePools)),
     endto: JSON.parse(JSON.stringify(base_endto)),
     grupoID: base_grupoID.slice(),
     grupoDJSolo: base_grupoDJSolo.slice(),
-    grupoAdv: base_grupoAdv.slice(),
+    grupoAdv: base_grupoAdv.slice(), // AD001..AD083
     grupoWeazelNews: base_grupoWeazelNews.slice(),
     musicIntroNarrations: Object.assign({}, base_musicIntroNarrations)
   },
   tlad: {
-    key:'tlad',
+    key: 'tlad',
     musicasList: tlad_musicasList.slice(),
     narracoesGeneral: tlad_narracoesGeneral.slice(),
     timePools: JSON.parse(JSON.stringify(tlad_timePools)),
     endto: JSON.parse(JSON.stringify(tlad_endto)),
-    grupoID: base_grupoID.slice(),
-    grupoDJSolo: tlad_grupoDJSolo.slice(),
-    grupoAdv: tlad_grupoAdv.slice(),
+    grupoID: base_grupoID.slice(),       // reuse IDs from ivbase
+    grupoDJSolo: tlad_grupoDJSolo.slice(), // *** USA A LISTA MODIFICADA (14-23) ***
+    grupoAdv: tlad_grupoAdv.slice(),     // AD001..AD093
     grupoWeazelNews: tlad_grupoWeazelNews.slice(),
     musicIntroNarrations: Object.assign({}, tlad_musicIntroNarrations)
   },
   ivtlad: {
-    key:'ivtlad',
+    key: 'ivtlad',
     musicasList: ivtlad_musicasList.slice(),
     narracoesGeneral: ivtlad_narracoesGeneral.slice(),
     timePools: JSON.parse(JSON.stringify(ivtlad_timePools)),
     endto: JSON.parse(JSON.stringify(ivtlad_endto)),
     grupoID: base_grupoID.slice(),
-    grupoDJSolo: ivtlad_grupoDJSolo.slice(),
+    grupoDJSolo: ivtlad_grupoDJSolo.slice(), // *** USA A LISTA COMPLETA (1-23) ***
     grupoAdv: ivtlad_grupoAdv.slice(),
     grupoWeazelNews: ivtlad_grupoWeazelNews.slice(),
     musicIntroNarrations: Object.assign({}, ivtlad_musicIntroNarrations)
   }
 };
 
-/* =================== Queues (shuffle) =================== */
+/* =================== Active program state & queues =================== */
+let currentProgram = 'ivbase';
+// let pendingProgram = null; // Removido, a troca agora é imediata
+let ativo = PROGRAMACOES[currentProgram];
+
 let musicQueue = [];
 let idQueue = [];
 let advQueue = [];
 
 function shuffle(arr){ const a = arr.slice(); for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]];} return a; }
-function resetMusicQueue(){ musicQueue = shuffle((PROGRAMACOES[radioState.currentProgram].musicasList || []).slice()); }
-function resetIDAdvQueues(){ idQueue = shuffle((PROGRAMACOES[radioState.currentProgram].grupoID || []).slice()); advQueue = shuffle((PROGRAMACOES[radioState.currentProgram].grupoAdv || []).slice()); }
+function resetMusicQueue(){ musicQueue = shuffle((ativo.musicasList || []).slice()); }
+function resetIDAdvQueues(){ idQueue = shuffle((ativo.grupoID || []).slice()); advQueue = shuffle((ativo.grupoAdv || []).slice()); }
 async function nextMusic(){ if(!musicQueue || musicQueue.length===0) resetMusicQueue(); return musicQueue.shift(); }
 async function nextID(){ if(!idQueue || idQueue.length===0) resetIDAdvQueues(); return idQueue.shift(); }
 async function nextAdv(){ if(!advQueue || advQueue.length===0) resetIDAdvQueues(); return advQueue.shift(); }
 
-/* =================== Build concrete sequence (with 70% narration chances) =================== */
-async function buildConcreteSequenceForProgram(programKey, overrideEndto=null){
-  const prog = PROGRAMACOES[programKey];
-  if(!prog) return null;
-  const sequencePool = [
-    {k:'id+musica', w:3},
-    {k:'djsolo+musica', w:3},
-    {k:'musica', w:3},
-    {k:'adv+musica', w:1},
-    {k:'adv+id+musica', w:1},
-    {k:'id+djsolo+musica', w:1}
-  ];
-  const seqKey = weightedPick(sequencePool);
-  const seq = { seqKey, parts: [], endtoRequest: null, programKey };
-
-  const pickFrom = (pool) => pool && pool.length ? pool[Math.floor(Math.random()*pool.length)] : null;
-
-  if(seqKey.startsWith('adv')){
-    const adv = await nextAdv(); if(adv) seq.parts.push({type:'adv', path:adv});
-    if(seqKey === 'adv+id+musica'){ const id2 = await nextID(); if(id2) seq.parts.push({type:'id', path:id2}); }
-  } else if(seqKey.startsWith('id')){
-    const id = await nextID(); if(id) seq.parts.push({type:'id', path:id});
-  } else if(seqKey === 'djsolo+musica'){
-    const d = pickFrom(prog.grupoDJSolo || []); if(d) seq.parts.push({type:'djsolo', path:d});
+/* =================== Durations JSON loader =================== */
+async function loadDuracoesJSON(){
+  try{
+    const resp = await fetch('duracoes_narracoes.json');
+    if(!resp.ok) throw new Error('duracoes json fetch failed ' + resp.status);
+    duracoesNarracoes = await resp.json();
+    log('Loaded duracoes_narracoes.json', Object.keys(duracoesNarracoes).length, 'entries');
+  }catch(e){
+    console.warn('Failed to load duracoes_narracoes.json', e);
+    duracoesNarracoes = {};
   }
-
-  if(seqKey === 'id+djsolo+musica'){
-    const d = pickFrom(prog.grupoDJSolo || []); if(d) seq.parts.push({type:'djsolo', path:d});
-  }
-
-  if(seqKey.includes('musica')){
-    const musicObj = await nextMusic();
-    if(musicObj){
-      const willIntro = (musicObj.introStart != null && musicObj.introEnd != null) && chance(0.7);
-      const willFinal = (musicObj.finalStart != null && musicObj.finalEnd != null) && chance(0.7);
-      const chosenNarrations = [];
-
-      if(willIntro){
-        const r = Math.random();
-        if(r < 0.4){
-          const pool = prog.narracoesGeneral || [];
-          const cand = chooseRandomCandidateThatFits(pool, musicObj.introEnd - musicObj.introStart);
-          if(cand) chosenNarrations.push({when:'intro', path:cand.path, dur:cand.dur, pool:'general'});
-        } else if(r < 0.8){
-          const pool = (prog.musicIntroNarrations && prog.musicIntroNarrations[musicObj.name]) || [];
-          const cand = chooseRandomCandidateThatFits(pool, musicObj.introEnd - musicObj.introStart);
-          if(cand) chosenNarrations.push({when:'intro', path:cand.path, dur:cand.dur, pool:'music-specific'});
-        } else {
-          const timePath = pickTimeNarration();
-          if(timePath){
-            const cand = chooseRandomCandidateThatFits([timePath], musicObj.introEnd - musicObj.introStart);
-            if(cand) chosenNarrations.push({when:'intro', path:cand.path, dur:cand.dur, pool:'time'});
-          }
-        }
-      }
-
-      if(willFinal){
-        const r2 = Math.random();
-        if(r2 < 0.7){
-          const pool = prog.narracoesGeneral || [];
-          const cand = chooseRandomCandidateThatFits(pool, musicObj.finalEnd - musicObj.finalStart);
-          if(cand) chosenNarrations.push({when:'final', path:cand.path, dur:cand.dur, pool:'general'});
-        } else {
-          const pick = weightedPick([{k:'toad',w:3},{k:'tonews',w:2},{k:'towheather',w:1}]);
-          const pool = (prog.endto && prog.endto[pick]) ? prog.endto[pick] : [];
-          const cand = chooseRandomCandidateThatFits(pool, musicObj.finalEnd - musicObj.finalStart);
-          if(cand){
-            chosenNarrations.push({when:'final', path:cand.path, dur:cand.dur, pool:'endto', subgroup:pick});
-            seq.endtoRequest = pick;
-          }
-        }
-      }
-
-      seq.parts.push({ type:'musica', music: musicObj, path: musicObj.arquivo, narrations: chosenNarrations });
-    }
-  }
-
-  if(overrideEndto) seq.endtoRequest = overrideEndto;
-  log('[BUILD_SEQ] built', seq.seqKey, 'program', programKey, 'parts', seq.parts.map(p=>p.type));
-  return seq;
 }
 
-/* =================== Preload exact files for sequence =================== */
-async function preloadExactSequence(sequence, preloadToken){
-  if(!sequence) return {loaded:[]};
-  const files = new Set();
-  for(const p of sequence.parts){
-    if(p.type === 'musica'){
-      if(p.path) files.add(p.path);
-      if(Array.isArray(p.narrations)) p.narrations.forEach(n => { if(n.path) files.add(n.path); });
+/* =================== Audio buffer fetch (JIT version) ===================
+   Agora inclui uma verificação de token para cancelar o carregamento se o programa mudar.
+*/
+async function getAudioBuffer(path, token = null){
+  // 1. Retorna do cache se existir
+  if(audioBufferCache.has(path)) return audioBufferCache.get(path);
+  
+  // 2. Verifica o token antes de buscar (otimização)
+  // Se um token foi passado e não é o token ativo, cancela.
+  if(token && token !== activePreloadToken) {
+    throw new Error(`Preload token stale for ${path}. Active: ${activePreloadToken}, Got: ${token}`);
+  }
+
+  try{
+    const resp = await fetch(path);
+    if(!resp.ok) throw new Error('fetch ' + resp.status + ' ' + path);
+    const ab = await resp.arrayBuffer();
+    
+    // 3. Verifica o token *depois* de buscar, antes de decodificar
+    // (A troca pode ter ocorrido durante o download)
+    if(token && token !== activePreloadToken) {
+      throw new Error(`Preload token stale after fetch ${path}. Active: ${activePreloadToken}, Got: ${token}`);
+    }
+
+    const buf = await audioCtx.decodeAudioData(ab);
+    
+    // 4. Armazena no cache e retorna
+    audioBufferCache.set(path, buf);
+    log('Cached buffer:', path);
+    return buf;
+  }catch(e){
+    // Não logar erros de token "stale" como warnings
+    if(e.message.includes('stale')) {
+      log('Preload canceled for:', path);
     } else {
-      if(p.path) files.add(p.path);
+      console.warn('getAudioBuffer error', path, e);
     }
+    throw e;
   }
-  if(sequence.endtoRequest === 'towheather'){
-    const wf = pickWeatherFile(currentWeatherMain); if(wf) files.add(wf);
-  }
-  const list = Array.from(files);
-  log('[PRELOAD] token', preloadToken, '-> starting preload', list.length, 'files');
-  for(const f of list){
-    if(preloadToken !== radioState.preloadToken){ log('[PRELOAD] token stale, abort preload', preloadToken); throw new Error('preload_token_stale'); }
-    if(audioBufferCache.has(f)){ log('[PRELOAD] already cached', f); continue; }
-    try{
-      await getAudioBuffer(f);
-      log('[PRELOAD] loaded', f);
-    }catch(e){
-      warn('[PRELOAD] failed load', f, e);
-      // continue trying others; caller may wait if necessary
-    }
-  }
-  log('[PRELOAD] token', preloadToken, '-> preload finished');
-  return {loaded:list};
 }
 
-/* =================== Play prepared sequence (uses cached buffers) =================== */
-async function playPreparedSequence(sequence){
-  if(!sequence) return;
-  log('[PLAY_SEQ] playing', sequence.seqKey, 'parts', sequence.parts.map(p=>p.type));
-  updateCover(DEFAULT_COVER);
-
-  for(const part of sequence.parts){
-    if(part.type === 'id' || part.type === 'adv' || part.type === 'djsolo' || part.type === 'news' || part.type === 'weather'){
-      try{
-        const buf = await getAudioBuffer(part.path);
-        log('[PLAY] starting', part.type, part.path);
-        await playBufferToDestination(buf);
-        log('[PLAY] ended', part.type, part.path);
-      }catch(e){
-        warn('[PLAY] error', part.path, e);
-      }
-    } else if(part.type === 'musica'){
-      await playMusicWithChosenNarrations(part.music, part.narrations || []);
-    }
-  }
-  log('[PLAY_SEQ] finished', sequence.seqKey);
+/* Helper plays */
+async function playBufferToDestination(buf){
+  return new Promise(r=>{
+    const s = audioCtx.createBufferSource(); s.buffer = buf; s.connect(audioCtx.destination);
+    s.onended = ()=>r(); s.start();
+  });
+}
+async function playBufferToNarrationGain(buf){
+  return new Promise(r=>{
+    const s = audioCtx.createBufferSource(); s.buffer = buf; s.connect(narrationGain);
+    s.onended = ()=>r(); s.start();
+  });
 }
 
-/* =================== Play music with chosen narrations (schedules) =================== */
-async function playMusicWithChosenNarrations(musicObj, narrationList){
-  if(!musicObj) return;
-  log('[PLAY_MUSIC] starting', musicObj.name, musicObj.arquivo);
-  // Update cover immediately when music starts
-  updateCover(musicObj.capa || DEFAULT_COVER, true);
-
-  const musicBuf = await getAudioBuffer(musicObj.arquivo);
-  const src = audioCtx.createBufferSource(); src.buffer = musicBuf; src.connect(musicGain);
-  const startAudioTime = audioCtx.currentTime;
-  src.start(startAudioTime);
-  log('[PLAY_MUSIC] started at audioTime', startAudioTime.toFixed(3), 'track', musicObj.name);
-
-  const scheduledPromises = [];
-  let endtoScheduled = false;
-  let endtoSubgroup = null;
-
-  for(const nar of narrationList){
-    if(nar.when === 'intro'){
-      const zoneStartMs = musicObj.introStart;
-      const zoneEndMs = musicObj.introEnd;
-      const res = await scheduleNarrationToEndAt(startAudioTime, zoneStartMs, zoneEndMs, nar.path, nar.dur, {when:'intro', pool:nar.pool});
-      if(res.scheduled) scheduledPromises.push(res.promise);
-    } else if(nar.when === 'final'){
-      const zoneStartMs = musicObj.finalStart;
-      const zoneEndMs = musicObj.finalEnd;
-      const res = await scheduleNarrationToEndAt(startAudioTime, zoneStartMs, zoneEndMs, nar.path, nar.dur, {when:'final', pool:nar.pool, subgroup:nar.subgroup});
-      if(res.scheduled){
-        scheduledPromises.push(res.promise);
-        if(nar.pool === 'endto' && nar.subgroup){ endtoScheduled = true; endtoSubgroup = nar.subgroup; }
-      }
-    }
+/* =================== Ducking control (Sem alterações) =================== */
+function onNarrationStart(){
+  activeNarrationsCount++;
+  if(duckReleaseTimeout){ clearTimeout(duckReleaseTimeout); duckReleaseTimeout=null; }
+  const now = audioCtx.currentTime;
+  musicGain.gain.cancelScheduledValues(now);
+  musicGain.gain.setValueAtTime(musicGain.gain.value, now);
+  musicGain.gain.linearRampToValueAtTime(DUCK_TARGET, now + DUCK_DOWN_TIME);
+  // log('Narration start -> duck to', DUCK_TARGET); // (reduzindo log)
+}
+function onNarrationEnd(){
+  activeNarrationsCount = Math.max(0, activeNarrationsCount-1);
+  if(activeNarrationsCount === 0){
+    duckReleaseTimeout = setTimeout(()=>{
+      const now = audioCtx.currentTime;
+      musicGain.gain.cancelScheduledValues(now);
+      musicGain.gain.setValueAtTime(musicGain.gain.value, now);
+      musicGain.gain.linearRampToValueAtTime(1.0, now + DUCK_UP_TIME);
+      duckReleaseTimeout = null;
+      // log('Narration end -> release duck to 1.0'); // (reduzindo log)
+    }, DUCK_RELEASE_DELAY_MS);
   }
-
-  await new Promise(resolve => src.onended = resolve);
-  log('[PLAY_MUSIC] track ended', musicObj.name);
-
-  if(scheduledPromises.length > 0){
-    try{ await Promise.all(scheduledPromises); }catch(e){ warn('[PLAY_MUSIC] waiting narrs error', e); }
-  }
-
-  // If had ENDTO final narration that queued a followup, handle it
-  if(endtoScheduled && endtoSubgroup){
-    log('[ENDTO] queued', endtoSubgroup);
-    await handleEndtoFollowupQueued(endtoSubgroup);
-  }
-
-  updateCover(DEFAULT_COVER);
 }
 
-/* =================== scheduleNarrationToEndAt =================== */
+/* =================== Cover handling (Sem alterações) =================== */
+function updateCover(newCover = DEFAULT_COVER, force=false){
+  const el = document.getElementById('capa') || document.getElementById('cover') || null;
+  if(!el) return;
+  const target = newCover || DEFAULT_COVER;
+  if(force || target !== currentCover){
+    el.src = target;
+    currentCover = target;
+    log('Cover set ->', target.includes('default') ? 'default' : target);
+  }
+}
+
+/* =================== Weather & TIME (Sem alterações) =================== */
+let currentWeatherMain = 'Clear';
+async function fetchWeather(){
+  try{
+    const key = '0cad953b1e9b3793a944d644d5193d3a';
+    const resp = await fetch(`https://api.openweathermap.org/data/2.5/weather?q=Maringa,BR&appid=${key}`);
+    const j = await resp.json();
+    currentWeatherMain = j && j.weather && j.weather[0] && j.weather[0].main ? j.weather[0].main : 'Clear';
+    log('Weather fetched:', currentWeatherMain);
+  }catch(e){
+    console.warn('fetchWeather failed', e);
+    currentWeatherMain = 'Clear';
+  }
+}
+
+function pickWeatherFile(condition){
+  if(!condition) return null;
+  const c = String(condition).toLowerCase();
+  const h = new Date().getHours();
+  if(c.includes('cloud')) { const n=Math.floor(Math.random()*11)+1; return `weather/CLOUD_${pad(n,2)}.wav`; }
+  if(c.includes('fog')||c.includes('mist')) { const n=Math.floor(Math.random()*12)+1; return `weather/FOG_${pad(n,2)}.wav`; }
+  if(c.includes('rain')) { const n=Math.floor(Math.random()*11)+1; return `weather/RAIN_${pad(n,2)}.wav`; }
+  if((c.includes('clear') || c.includes('sun')) && h >= 5 && h <= 18) { const n=Math.floor(Math.random()*12)+1; return `weather/SUN_${pad(n,2)}.wav`; }
+  if(c.includes('wind')||c.includes('breeze')) { const n=Math.floor(Math.random()*11)+1; return `weather/WIND_${pad(n,2)}.wav`; }
+  return null;
+}
+
+/* pick time narration from the active program */
+function pickTimeNarration(){
+  const h = new Date().getHours();
+  if(h>=4 && h<=10){ const pool = ativo.timePools?.morning || []; return pool.length ? pool[Math.floor(Math.random()*pool.length)] : null; }
+  if(h>=13 && h<=16){ const pool = ativo.timePools?.afternoon || []; return pool.length ? pool[Math.floor(Math.random()*pool.length)] : null; }
+  if(h>=18 && h<=19){ const pool = ativo.timePools?.evening || []; return pool.length ? pool[Math.floor(Math.random()*pool.length)] : null; }
+  if(h>=21 || h<=1){ const pool = ativo.timePools?.night || []; return pool.length ? pool[Math.floor(Math.random()*pool.length)] : null; }
+  return null;
+}
+
+/* =================== Candidate filtering (Sem alterações) =================== */
+function filterCandidatesByZone(candidates, zoneLenMs){
+  if(!candidates || candidates.length===0) return [];
+  const out = [];
+  for(const p of candidates){
+    const parts = p.split('/'); const fname = parts[parts.length-1];
+    const d = duracoesNarracoes[fname];
+    if(typeof d === 'number' && d <= zoneLenMs) out.push({path:p,dur:d});
+  }
+  return out;
+}
+function chooseRandomCandidateThatFits(poolPaths, zoneLenMs){
+  const filtered = filterCandidatesByZone(poolPaths, zoneLenMs);
+  if(filtered.length===0) return null;
+  return filtered[Math.floor(Math.random()*filtered.length)];
+}
+
+/* =================== Schedule narration (Sem alterações) =================== */
 async function scheduleNarrationToEndAt(musicStartAudioTime, zoneStartMs, zoneEndMs, candidatePath, candidateDurMs, meta={}){
   if(!candidatePath) return {scheduled:false};
   const durMs = candidateDurMs;
   let startOffsetSec = (zoneEndMs - durMs) / 1000;
-  if(startOffsetSec < zoneStartMs / 1000) startOffsetSec = zoneStartMs / 1000;
+  if(startOffsetSec < zoneStartMs/1000) startOffsetSec = zoneStartMs/1000;
   const startAudioTime = musicStartAudioTime + startOffsetSec;
 
   try{
-    const buf = await getAudioBuffer(candidatePath);
+    // O buffer JÁ DEVE ESTAR EM CACHE por causa do 'prepareNextSequence'
+    const buf = await getAudioBuffer(candidatePath); // Pega do cache
     const src = audioCtx.createBufferSource();
     src.buffer = buf; src.connect(narrationGain);
 
     const now = audioCtx.currentTime;
     const leadMs = 40;
-    const duckDelayMs = Math.max(0, (startAudioTime - now) * 1000 - leadMs);
+    const duckDelayMs = Math.max(0, (startAudioTime - now)*1000 - leadMs);
     if(duckDelayMs > 0){
       setTimeout(()=>{ onNarrationStart(); }, duckDelayMs);
     } else {
@@ -587,352 +432,511 @@ async function scheduleNarrationToEndAt(musicStartAudioTime, zoneStartMs, zoneEn
     try { src.start(startAudioTime); } catch(e){ src.start(); }
 
     const p = new Promise(resolve => {
-      src.onended = () => { onNarrationEnd(); resolve({path:candidatePath, meta}); };
+      src.onended = () => {
+        onNarrationEnd();
+        resolve({path:candidatePath, meta});
+      };
     });
-    log('[SCHEDULE] narration scheduled', candidatePath, 'startAudioTime', startAudioTime.toFixed(3));
+    // log('Scheduled narration', candidatePath, 'startAudioTime', startAudioTime.toFixed(3));
     return {scheduled:true, promise:p, chosen:candidatePath, dur:durMs, meta};
   }catch(e){
-    warn('[SCHEDULE] failed to schedule', candidatePath, e);
+    console.warn('scheduleNarrationToEndAt failed', candidatePath, e);
     return {scheduled:false};
   }
 }
 
-/* =================== handleEndtoFollowupQueued =================== */
-async function handleEndtoFollowupQueued(subgroup){
-  if(!subgroup) return;
-  log('[ENDTO_FOLLOWUP] handling', subgroup, 'currentProgram', radioState.currentProgram);
-  updateCover(DEFAULT_COVER);
-  const prog = PROGRAMACOES[radioState.currentProgram];
-
-  if(subgroup === 'toad'){
-    const pick = Math.random() < 0.5 ? 'adv+musica' : 'adv+id+musica';
-    await runSequenceImmediately(pick);
-  } else if(subgroup === 'tonews'){
-    const pool = prog.grupoWeazelNews || [];
-    const item = pool.length ? rand(pool) : null;
-    if(item) await playNarrationImmediate(item);
-    const pick = Math.random() < 0.5 ? 'id+musica' : 'musica';
-    await runSequenceImmediately(pick);
-  } else if(subgroup === 'towheather'){
-    const weatherFile = pickWeatherFile(currentWeatherMain);
-    if(weatherFile) await playNarrationImmediate(weatherFile);
-    const pick = Math.random() < 0.5 ? 'id+musica' : 'musica';
-    await runSequenceImmediately(pick);
-  }
-}
-
-/* =================== playNarrationImmediate & runSequenceImmediately =================== */
+/* =================== Play immediate narration (Helper) =================== */
 async function playNarrationImmediate(path){
+  if(!path) return;
+  updateCover(DEFAULT_COVER);
   try{
+    // O buffer JÁ DEVE ESTAR EM CACHE
     const buf = await getAudioBuffer(path);
-    requestAnimationFrame(()=>onNarrationStart());
+    onNarrationStart();
     await playBufferToNarrationGain(buf);
     onNarrationEnd();
   }catch(e){
-    warn('[PLAY_NARR_IMMEDIATE] error', path, e);
+    console.warn('playNarrationImmediate failed', path, e);
   }
 }
 
-async function runSequenceImmediately(seq){
-  log('[RUN_IMMEDIATE]', seq, 'program', radioState.currentProgram);
-  switch(seq){
-    case 'adv+musica': {
-      const adv = await nextAdv(); if(adv) await playBufferToDestination(await getAudioBuffer(adv));
-      const m = await nextMusic(); if(m) await playMusicWithChosenNarrations(m, []);
-      break;
-    }
-    case 'adv+id+musica': {
-      const adv = await nextAdv(); if(adv) await playBufferToDestination(await getAudioBuffer(adv));
-      const id = await nextID(); if(id) await playBufferToDestination(await getAudioBuffer(id));
-      const m = await nextMusic(); if(m) await playMusicWithChosenNarrations(m, []);
-      break;
-    }
-    case 'id+musica': {
-      const id = await nextID(); if(id) await playBufferToDestination(await getAudioBuffer(id));
-      const m = await nextMusic(); if(m) await playMusicWithChosenNarrations(m, []);
-      break;
-    }
-    case 'id+djsolo+musica': {
-      const id = await nextID(); if(id) await playBufferToDestination(await getAudioBuffer(id));
-      const d = rand(PROGRAMACOES[radioState.currentProgram].grupoDJSolo); if(d) await playBufferToDestination(await getAudioBuffer(d));
-      const m = await nextMusic(); if(m) await playMusicWithChosenNarrations(m, []);
-      break;
-    }
-    case 'djsolo+musica': {
-      const d = rand(PROGRAMACOES[radioState.currentProgram].grupoDJSolo); if(d) await playBufferToDestination(await getAudioBuffer(d));
-      const m = await nextMusic(); if(m) await playMusicWithChosenNarrations(m, []);
-      break;
-    }
-    case 'musica': {
-      const m = await nextMusic(); if(m) await playMusicWithChosenNarrations(m, []);
-      break;
-    }
-    default:
-      warn('[RUN_IMMEDIATE] unknown', seq);
+/* =================== Sequence pool (Sem alterações) =================== */
+const sequencePool = [
+  {k:'id+musica', w:3},
+  {k:'djsolo+musica', w:3},
+  {k:'musica', w:3},
+  {k:'adv+musica', w:1},
+  {k:'adv+id+musica', w:1},
+  {k:'id+djsolo+musica', w:1}
+];
+function pickSequenceWeighted(){ return weightedPick(sequencePool); }
+
+
+/* ================================================================= */
+/* =================== NOVA ARQUITETURA DE SEQUÊNCIA (v2) =================== */
+/* ================================================================= */
+
+/**
+ * (NOVO) Resolve qual narração será usada para uma zona (intro/final).
+ * Esta função apenas *decide* e *seleciona* o arquivo, não o agenda.
+ * Retorna: { path: '...', dur: 1234, subgroup: 'toad' | null } ou null
+ */
+function resolveNarrationForZone(musicObj, zoneType) {
+  const isIntro = zoneType === 'intro';
+  const zoneStart = isIntro ? musicObj.introStart : musicObj.finalStart;
+  const zoneEnd = isIntro ? musicObj.introEnd : musicObj.finalEnd;
+
+  if (zoneStart == null || zoneEnd == null) {
+    // log(isIntro ? 'Intro' : 'Final', 'zone absent for', musicObj.name);
+    return null; // Sem zona
   }
+  
+  if (!chance(0.7)) {
+    // log(isIntro ? 'Intro' : 'Final', 'skipped by chance for', musicObj.name);
+    return null; // Sorteado para não ter narração
+  }
+
+  const zoneLen = zoneEnd - zoneStart;
+  const r = Math.random();
+
+  if (isIntro) {
+    // Lógica de INTRO
+    if (r < 0.4) {
+      const pool = ativo.narracoesGeneral || [];
+      const chosen = chooseRandomCandidateThatFits(pool, zoneLen);
+      if(chosen) return { ...chosen, subgroup: null };
+      // log('Intro: no general candidate fits for', musicObj.name);
+    } else if (r < 0.8) {
+      const pool = ativo.musicIntroNarrations && ativo.musicIntroNarrations[musicObj.name] ? ativo.musicIntroNarrations[musicObj.name] : [];
+      if (pool.length > 0) {
+        const chosen = chooseRandomCandidateThatFits(pool, zoneLen);
+        if(chosen) return { ...chosen, subgroup: null };
+        // log('Intro: none music-specific fit for', musicObj.name);
+      }
+    } else {
+      const timePath = pickTimeNarration();
+      if (timePath) {
+        const chosen = chooseRandomCandidateThatFits([timePath], zoneLen);
+        if(chosen) return { ...chosen, subgroup: null };
+        // log('Intro: time narration too long for', musicObj.name);
+      }
+    }
+  } else {
+    // Lógica de FINAL
+    if (r < 0.7) {
+      const pool = ativo.narracoesGeneral || [];
+      const chosen = chooseRandomCandidateThatFits(pool, zoneLen);
+      if(chosen) return { ...chosen, subgroup: null };
+      // log('Final: no general candidate fits for', musicObj.name);
+    } else {
+      // É um ENDTO
+      const pick = weightedPick([{k:'toad',w:3},{k:'tonews',w:2},{k:'towheather',w:1}]);
+      const pool = (ativo.endto && ativo.endto[pick]) ? ativo.endto[pick] : [];
+      const chosen = chooseRandomCandidateThatFits(pool, zoneLen);
+      if(chosen) return { ...chosen, subgroup: pick }; // Retorna o subgroup!
+      // log('Final: no ENDTO candidate fits for', musicObj.name, 'subgroup', pick);
+    }
+  }
+  
+  return null; // Nenhuma narração encontrada ou coube
 }
 
-/* =================== pruneCacheKeepSequences =================== */
-function pruneCacheKeepSequences(currentSeq, nextSeq){
-  try{
-    const keep = new Set();
-    const addSeq = (s) => {
-      if(!s) return;
-      for(const p of s.parts){
-        if(p.type === 'musica'){
-          if(p.path) keep.add(p.path);
-          if(p.narrations) p.narrations.forEach(n => { if(n.path) keep.add(n.path); });
-        } else {
-          if(p.path) keep.add(p.path);
+/**
+ * (NOVO) Prepara a *próxima* sequência.
+ * Resolve todos os arquivos aleatórios, e carrega-os na memória.
+ */
+async function prepareNextSequence(token) {
+  if (isPreloadingNext) {
+    log('Preload já em progresso.');
+    return;
+  }
+  isPreloadingNext = true;
+  
+  // *** CORREÇÃO ENDTO ***
+  // O 'currentFollowupHint' é usado AQUI para decidir o tipo de sequência.
+  log(`Preparando próxima sequência... (Token: ${token}, Hint: ${currentFollowupHint}, Prog: ${currentProgram})`);
+
+  let seqType = null;
+  const filesToLoad = new Set();
+  const job = {
+    token: token,
+    type: null,
+    music: null,
+    id: null,
+    adv: null,
+    djsolo: null,
+    news: null,
+    weather: null,
+    narrations: { intro: null, final: null },
+    endtoTrigger: null // O que esta sequência vai disparar?
+  };
+
+  try {
+    // 1. Decidir o TIPO de sequência
+    // Se a *última* sequência disparou um ENDTO, forçamos a sequência de followup
+    if (currentFollowupHint === 'toad') {
+      seqType = chance(0.5) ? 'adv+musica' : 'adv+id+musica';
+    } else if (currentFollowupHint === 'tonews') {
+      seqType = chance(0.5) ? 'news+musica' : 'news+id+musica';
+    } else if (currentFollowupHint === 'towheather') {
+      seqType = chance(0.5) ? 'weather+musica' : 'weather+id+musica';
+    } else {
+      // Padrão
+      seqType = pickSequenceWeighted();
+    }
+    job.type = seqType;
+    log('Sequência resolvida:', seqType);
+
+    // 2. Resolver os arquivos para esse tipo
+    // (Lógica baseada nos blocos 'case' da função antiga)
+    
+    if (seqType.includes('id')) {
+      job.id = await nextID();
+      if(job.id) filesToLoad.add(job.id);
+    }
+    if (seqType.includes('adv')) {
+      job.adv = await nextAdv();
+      if(job.adv) filesToLoad.add(job.adv);
+    }
+    if (seqType.includes('djsolo')) {
+      job.djsolo = rand(ativo.grupoDJSolo);
+      if(job.djsolo) filesToLoad.add(job.djsolo);
+    }
+    if (seqType.includes('news')) {
+      job.news = rand(ativo.grupoWeazelNews);
+      if(job.news) filesToLoad.add(job.news);
+    }
+     if (seqType.includes('weather')) {
+      job.weather = pickWeatherFile(currentWeatherMain);
+      if(job.weather) filesToLoad.add(job.weather);
+    }
+
+    // Resolver música e suas narrações (quase sempre presente)
+    if (seqType.includes('musica')) {
+      job.music = await nextMusic();
+      if (job.music && job.music.arquivo) {
+        filesToLoad.add(job.music.arquivo);
+        
+        // Resolver narrações para a música
+        job.narrations.intro = resolveNarrationForZone(job.music, 'intro');
+        if(job.narrations.intro) filesToLoad.add(job.narrations.intro.path);
+
+        job.narrations.final = resolveNarrationForZone(job.music, 'final');
+        if(job.narrations.final) {
+          filesToLoad.add(job.narrations.final.path);
+          job.endtoTrigger = job.narrations.final.subgroup; // Armazena o gatilho!
         }
       }
-    };
-    addSeq(currentSeq); addSeq(nextSeq);
-    for(const k of Array.from(audioBufferCache.keys())){
-      if(!keep.has(k)){ audioBufferCache.delete(k); log('[PRUNE] removed', k); }
     }
-  }catch(e){
-    warn('[PRUNE] error', e);
+    
+    // 3. Carregar os arquivos
+    const files = Array.from(filesToLoad).filter(Boolean);
+    log('Carregando', files.length, 'arquivos para a próxima sequência...');
+    
+    const loadPromises = files.map(path => getAudioBuffer(path, token));
+    await Promise.all(loadPromises);
+
+    // 4. Se o token ainda for válido, salvar o trabalho
+    if (token === activePreloadToken) {
+      log('Próxima sequência pronta e carregada.');
+      nextSequenceJob = job;
+    } else {
+      log('Carregamento da sequência concluído, mas o token expirou (programa mudou). Descartando.');
+      nextSequenceJob = null;
+    }
+    
+  } catch (e) {
+    // Erros de token "stale" são esperados
+    if (String(e.message).includes('stale')) {
+      log('Preparação da sequência cancelada pela troca de token.');
+    } else {
+      console.error('Falha ao preparar a próxima sequência:', e);
+    }
+    nextSequenceJob = null;
+  } finally {
+    isPreloadingNext = false;
   }
 }
 
-/* =================== Helper: startPlayingPreparedSequenceWithStartSignal =================== */
-/* Plays sequence inline but returns two promises:
-   - startedPromise resolves as soon as first audio actually starts
-   - playPromise resolves when whole sequence finishes
-   Also ensures cover updated when a music part starts playing.
-*/
-function startPlayingPreparedSequenceWithStartSignal(sequence){
-  const startedDeferred = {};
-  const playDeferred = {};
-  startedDeferred.promise = new Promise(resolve => { startedDeferred.resolve = resolve; });
-  playDeferred.promise = new Promise(resolve => { playDeferred.resolve = resolve; });
+/**
+ * (NOVO) Toca uma música e agenda as narrações que JÁ FORAM RESOLVIDAS.
+ * Versão simplificada de 'playMusicWithNarrations'
+ */
+async function playMusicWithResolvedNarrations(musicObj, introNarration, finalNarration) {
+  if (!musicObj) {
+    log('playMusicWithResolvedNarrations: Nenhum objeto de música fornecido.');
+    return;
+  }
+  
+  log('Now playing track:', musicObj.name, 'program', ativo.key);
+  updateCover(musicObj.capa || DEFAULT_COVER, true);
 
-  (async () => {
-    try{
-      log('[PLAY_STARTER] starting sequence inline', sequence.seqKey);
-      let firstStarted = false;
-      for(const part of sequence.parts){
-        if(part.type === 'id' || part.type === 'adv' || part.type === 'djsolo' || part.type === 'news' || part.type === 'weather'){
-          try{
-            const buf = await getAudioBuffer(part.path);
-            const src = audioCtx.createBufferSource(); src.buffer = buf; src.connect(audioCtx.destination);
-            if(!firstStarted){ firstStarted = true; startedDeferred.resolve(); log('[PLAY_STARTER] first part started', part.type, part.path); }
-            await new Promise(res => { src.onended = res; src.start(); });
-            log('[PLAY_STARTER] part ended', part.type, part.path);
-          }catch(e){
-            warn('[PLAY_STARTER] error playing part', part, e);
+  const musicBuf = await getAudioBuffer(musicObj.arquivo); // Pega do cache
+  const musicSrc = audioCtx.createBufferSource();
+  musicSrc.buffer = musicBuf;
+  musicSrc.connect(musicGain);
+  const musicStartAudioTime = audioCtx.currentTime;
+  musicSrc.start(musicStartAudioTime);
+  // log('Music started at audioTime', musicStartAudioTime.toFixed(3));
+
+  const scheduledPromises = [];
+
+  // Agendar intro (se resolvida)
+  if (introNarration) {
+    const res = await scheduleNarrationToEndAt(
+      musicStartAudioTime,
+      musicObj.introStart, musicObj.introEnd,
+      introNarration.path, introNarration.dur,
+      { reason: 'intro' }
+    );
+    if (res.scheduled) scheduledPromises.push(res.promise);
+  }
+
+  // Agendar final (se resolvida)
+  if (finalNarration) {
+     const res = await scheduleNarrationToEndAt(
+      musicStartAudioTime,
+      musicObj.finalStart, musicObj.finalEnd,
+      finalNarration.path, finalNarration.dur,
+      { reason: 'final', subgroup: finalNarration.subgroup }
+    );
+    if (res.scheduled) scheduledPromises.push(res.promise);
+  }
+
+  // Esperar a música terminar
+  await new Promise(resolve => musicSrc.onended = resolve);
+  log('Music ended:', musicObj.name);
+
+  // Esperar narrações agendadas terminarem
+  if (scheduledPromises.length > 0) {
+    try { await Promise.all(scheduledPromises); } catch (e) { console.warn('Error waiting scheduled narrs', e); }
+  }
+  
+  updateCover(DEFAULT_COVER);
+}
+
+/**
+ * (NOVO) Executa o trabalho da sequência que JÁ ESTÁ EM CACHE.
+ */
+async function executeSequence(job) {
+  log('Executando sequência:', job.type);
+  
+  try {
+    // 1. Tocar blocos de "interrupção" (News, Weather)
+    if (job.news) {
+      await playNarrationImmediate(job.news);
+    }
+    if (job.weather) {
+      await playNarrationImmediate(job.weather);
+    }
+
+    // 2. Tocar blocos pré-música (ADV, ID, DJSolo)
+    if (job.adv) {
+      log('Playing ADV', job.adv);
+      updateCover(DEFAULT_COVER);
+      await playBufferToDestination(await getAudioBuffer(job.adv));
+    }
+    if (job.id) {
+      log('Playing ID', job.id);
+      updateCover(DEFAULT_COVER);
+      await playBufferToDestination(await getAudioBuffer(job.id));
+    }
+    if (job.djsolo) {
+      log('Playing DJSOLO', job.djsolo);
+      updateCover(DEFAULT_COVER);
+      await playBufferToDestination(await getAudioBuffer(job.djsolo));
+    }
+
+    // 3. Tocar a música principal (com suas narrações internas)
+    if (job.music) {
+      await playMusicWithResolvedNarrations(
+        job.music,
+        job.narrations.intro,
+        job.narrations.final
+      );
+    }
+    
+    // *** CORREÇÃO ENDTO ***
+    // A definição do HINT foi MOVIDA para o mainSequenceRunner
+    // currentFollowupHint = job.endtoTrigger || null; // <--- LINHA REMOVIDA
+    
+  } catch (e) {
+    console.error('Erro ao executar sequência:', job.type, e);
+    // currentFollowupHint = null; // Reseta o hint em caso de erro (movido tbm)
+  }
+  
+  log('Sequência finalizada:', job.type);
+}
+
+
+/**
+ * (MODIFICADO) Loop principal da rádio.
+ * Lógica de ENDTO e troca de programa corrigidas.
+ */
+async function mainSequenceRunner() {
+  log('Main sequence runner iniciado.');
+  
+  while (started) {
+    try {
+      // 1. *** CORREÇÃO PROGRAM CHANGE ***
+      // A troca de programa (chamada por setProgramacao) agora é imediata
+      // e cancela 'nextSequenceJob' e 'isPreloadingNext'.
+      // Não precisamos mais checar 'pendingProgram' aqui.
+
+      // 2. Garantir que a *próxima* sequência esteja pronta
+      if (!nextSequenceJob) {
+        if (isPreloadingNext) {
+          log('Aguardando preload (provavelmente sendo cancelado) terminar...');
+          while (isPreloadingNext && !nextSequenceJob) {
+            await sleep(100);
           }
-        } else if(part.type === 'musica'){
-          try{
-            // update cover before starting actual music
-            updateCover(part.music.capa || DEFAULT_COVER, true);
-            const musicBuf = await getAudioBuffer(part.path);
-            const src = audioCtx.createBufferSource(); src.buffer = musicBuf; src.connect(musicGain);
-            const startTime = audioCtx.currentTime;
-            src.start(startTime);
-            if(!firstStarted){ firstStarted = true; startedDeferred.resolve(); log('[PLAY_STARTER] music started', part.music.name); }
-            // schedule narrations
-            const scheduled = [];
-            for(const nar of (part.narrations || [])){
-              if(nar.when === 'intro'){
-                const res = await scheduleNarrationToEndAt(startTime, part.music.introStart, part.music.introEnd, nar.path, nar.dur, {when:'intro'});
-                if(res.scheduled) scheduled.push(res.promise);
-              } else if(nar.when === 'final'){
-                const res = await scheduleNarrationToEndAt(startTime, part.music.finalStart, part.music.finalEnd, nar.path, nar.dur, {when:'final', subgroup:nar.subgroup});
-                if(res.scheduled) scheduled.push(res.promise);
-              }
-            }
-            await new Promise(res => { src.onended = res; });
-            log('[PLAY_STARTER] music ended', part.music.name);
-            if(scheduled.length) try{ await Promise.all(scheduled); }catch(e){ warn('[PLAY_STARTER] waiting narrs error', e); }
-          }catch(e){
-            warn('[PLAY_STARTER] error during music part', e);
-          }
-        }
-      }
-    }catch(e){
-      warn('[PLAY_STARTER] inline player error', e);
-    }finally{
-      playDeferred.resolve();
-    }
-  })();
-
-  return { startedPromise: startedDeferred.promise, playPromise: playDeferred.promise };
-}
-
-/* =================== sequenceLoopMain - core loop implementing requested behavior =================== */
-async function sequenceLoopMain(){
-  if(sequenceLoopRunning){ log('[LOOP] already running, ignoring'); return; }
-  sequenceLoopRunning = true;
-  sequenceLoopToken++; const myToken = sequenceLoopToken;
-  radioState.running = true;
-  log('[LOOP] started token', myToken, 'initial program', radioState.currentProgram);
-
-  // ensure queues for current program
-  resetMusicQueue(); resetIDAdvQueues();
-
-  try{
-    // Build initial preparedCurrent
-    let preparedCurrent = await buildConcreteSequenceForProgram(radioState.currentProgram, null);
-    log('[LOOP] preparedCurrent built', preparedCurrent ? preparedCurrent.seqKey : 'NULL');
-
-    // preload preparedCurrent (we need current to be playable before starting)
-    radioState.preloadToken++;
-    const firstPreloadToken = radioState.preloadToken;
-    try{
-      log('[LOOP] preloading preparedCurrent files token', firstPreloadToken);
-      await preloadExactSequence(preparedCurrent, firstPreloadToken);
-    }catch(e){
-      if(String(e).includes('preload_token_stale')){ log('[LOOP] initial preload aborted token stale'); sequenceLoopRunning=false; radioState.running=false; return; }
-      else warn('[LOOP] error preloading initial preparedCurrent', e);
-    }
-
-    let preparedNext = null;
-    let nextPreloadPromise = null;
-
-    while(sequenceLoopToken === myToken){
-      // Build preparedNext now (so it can reflect ENDTO of preparedCurrent)
-      preparedNext = await buildConcreteSequenceForProgram(radioState.nextProgram || radioState.currentProgram, preparedCurrent.endtoRequest || null);
-      log('[LOOP] preparedNext built', preparedNext ? preparedNext.seqKey : 'NULL');
-
-      // Start playing preparedCurrent and start preload of preparedNext only when preparedCurrent actually starts
-      const playStarter = startPlayingPreparedSequenceWithStartSignal(preparedCurrent);
-      // Wait for startedPromise to ensure playback actually began (and thus mobile contexts are unlocked)
-      await playStarter.startedPromise;
-      log('[LOOP] preparedCurrent has started playback; starting preload for preparedNext');
-
-      // Start preload for preparedNext
-      radioState.preloadToken++;
-      const preloadTokenForNext = radioState.preloadToken;
-      radioState.preparingNext = true;
-      nextPreloadPromise = preloadExactSequence(preparedNext, preloadTokenForNext).catch(err => {
-        if(String(err).includes('preload_token_stale')) log('[LOOP] next preload cancelled token stale');
-        else warn('[LOOP] next preload failed', err);
-      }).finally(()=>{ radioState.preparingNext = false; });
-
-      // Wait for the full playPromise (preparedCurrent to end)
-      await playStarter.playPromise;
-      log('[LOOP] preparedCurrent playback finished');
-
-      // Decide whether to apply pending program change
-      // Apply pending change now (after current ended) if exists
-      if(radioState.nextProgram && radioState.nextProgram !== radioState.currentProgram){
-        log('[LOOP] applying pending program change ->', radioState.nextProgram, 'old', radioState.currentProgram);
-        radioState.currentProgram = radioState.nextProgram;
-        radioState.nextProgram = null;
-        radioState.changingProgram = false;
-        // rebuild queues for new program
-        resetMusicQueue(); resetIDAdvQueues();
-        // Rebuild preparedNext to reflect new program (if preparedNext was built for old program)
-        preparedNext = await buildConcreteSequenceForProgram(radioState.currentProgram, preparedCurrent.endtoRequest || null);
-        // Preload preparedNext now (ensure ready)
-        radioState.preloadToken++;
-        const newPreloadToken = radioState.preloadToken;
-        try{ await preloadExactSequence(preparedNext, newPreloadToken); }catch(e){ if(String(e).includes('preload_token_stale')) log('[LOOP] rebuild preload canceled'); else warn('[LOOP] rebuild preload failed', e); }
-      } else {
-        // No program change; ensure preparedNext preload finished
-        if(nextPreloadPromise){
-          log('[LOOP] waiting for preparedNext preload to finish before playing it');
-          try{ await nextPreloadPromise; }catch(e){ /* already logged */ }
-        } else {
-          log('[LOOP] nextPreloadPromise missing - this is unexpected');
+        } 
+        
+        // Se 'nextSequenceJob' ainda é nulo (ou foi cancelado), preparar um novo.
+        if (!nextSequenceJob) {
+          log('Próxima sequência não está pronta. Preparando agora...');
+          // 'prepareNextSequence' usará o 'currentFollowupHint' (se houver)
+          // e o 'ativo' (programa) que estiverem vigentes *agora*.
+          await prepareNextSequence(activePreloadToken);
         }
       }
 
-      // prune cache to keep only current-next
-      pruneCacheKeepSequences(preparedCurrent, preparedNext);
-
-      // rotate: current <- next
-      preparedCurrent = preparedNext;
-      preparedNext = null;
-
-      // go next iteration: preparedCurrent is ready (preloaded) and will be played on loop start
-      if(sequenceLoopToken !== myToken){
-        log('[LOOP] token changed, exiting loop');
-        break;
+      // 3. Se ainda assim falhar (ex: token mudou bem na hora), tentar de novo
+      if (!nextSequenceJob) {
+        log('Preparação da sequência falhou ou foi cancelada. Reiniciando loop.');
+        await sleep(50);
+        continue; // Volta ao início do loop
       }
-    } // end while
-  }catch(e){
-    warn('[LOOP] error in sequenceLoopMain', e);
-  }finally{
-    sequenceLoopRunning = false;
-    radioState.running = false;
-    log('[LOOP] sequenceLoopMain finished');
+
+      // 4. *** CORREÇÃO ENDTO ***
+      // Definir o HINT para o *próximo* preload (que vai rodar em background)
+      // baseado no resultado do preload que *acabou de terminar*.
+      currentFollowupHint = nextSequenceJob.endtoTrigger || null;
+      log(`Hint para a próxima sequência definido para: ${currentFollowupHint}`);
+      
+      // 5. Temos um trabalho. Mover para "current" e limpar "next"
+      const currentJob = nextSequenceJob;
+      nextSequenceJob = null;
+      
+      // 6. Iniciar o preload da *próxima* sequência (em background)
+      // Este 'prepareNextSequence' usará o 'currentFollowupHint' que acabamos de definir.
+      prepareNextSequence(activePreloadToken).catch(e => {
+        if (!String(e.message).includes('stale')) {
+           console.error('Erro no preload em background:', e);
+        }
+      });
+      
+      // 7. Executar o trabalho atual (e aguardar)
+      await executeSequence(currentJob);
+
+    } catch (e) {
+      console.error('Erro crítico no mainSequenceRunner:', e);
+      await sleep(1000); // Pausa antes de tentar de novo
+    }
   }
 }
 
-/* =================== setProgramacao (handles clicks) =================== */
-function setProgramacao(key){
-  if(!PROGRAMACOES[key]){ warn('[SET_PROGRAM] unknown program', key); return; }
-  if(!radioState.started){
-    radioState.currentProgram = key;
-    radioState.nextProgram = null;
-    radioState.changingProgram = false;
-    log('[SET_PROGRAM] before start -> currentProgram set to', key);
-    return;
+/* =================== Gerenciamento de Programa =================== */
+
+/**
+ * (MODIFICADO) Aplica a mudança de programa pendente.
+ * Agora é imediata e cancela o preload em andamento.
+ */
+function setProgramacao(name){
+  if(!PROGRAMACOES[name]) { 
+    log('Programação desconhecida', name); 
+    return; 
   }
-  // after started: if clicked same as current -> ignore
-  if(key === radioState.currentProgram){
-    log('[SET_PROGRAM] clicked current program -> ignore', key);
-    // if there is a pending nextProgram that equals current, clear? by spec we keep current playing
-    return;
+  if(name === currentProgram){ 
+    log('Programação já ativa:', name); 
+    return; 
   }
-  // clicked program equals pending nextProgram -> ignore
-  if(key === radioState.nextProgram){
-    log('[SET_PROGRAM] clicked program already pending -> ignore', key);
-    return;
+  
+  log('Programação', name, 'solicitada. Mudando imediatamente.');
+  const prevProgram = currentProgram;
+  currentProgram = name;
+  ativo = PROGRAMACOES[currentProgram]; // *** Troca o 'ativo' imediatamente ***
+  
+  // Resetar as filas de seleção para o novo programa
+  resetMusicQueue();
+  resetIDAdvQueues();
+  
+  log('Program switched to', currentProgram, 'from', prevProgram);
+
+  // **** CRÍTICO: Cancelar qualquer preload em andamento ****
+  // Ao incrementar o token, qualquer 'getAudioBuffer' ou 'prepareNextSequence'
+  // em andamento com o token antigo irá falhar ou ser descartado.
+  preloadTokenCounter++;
+  activePreloadToken = preloadTokenCounter;
+  log('Novo token de preload ativo:', activePreloadToken);
+  
+  // Limpar o trabalho da próxima sequência (não é mais válido)
+  if (nextSequenceJob) {
+    log('Descartando sequência pré-carregada do programa anterior.');
+    nextSequenceJob = null;
   }
-  // else set as nextProgram (replace any previous pending)
-  log('[SET_PROGRAM] setting pending nextProgram ->', key);
-  radioState.nextProgram = key;
-  radioState.changingProgram = true;
+  if (isPreloadingNext) {
+     log('Sinalizando cancelamento de preload em andamento...');
+     isPreloadingNext = false; // Permite que o novo preload comece no loop
+  }
+  
+  // O mainSequenceRunner, ao terminar a música atual, verá
+  // 'nextSequenceJob' como nulo e chamará 'prepareNextSequence'.
+  // Esta chamada usará o *novo* 'ativo' e o *novo* 'activePreloadToken',
+  // e respeitará o 'currentFollowupHint' (ENDTO) que estiver no ar.
 }
 
-/* =================== startRadio (must be called from a user gesture) =================== */
-async function startRadio(){
-  if(radioState.started){ log('[START] already started -> ignoring'); return; }
-  radioState.started = true;
-  // attempt to resume AudioContext immediately (important for mobile)
-  try{
-    if(audioCtx.state === 'suspended'){ await audioCtx.resume(); log('[START] audioCtx resumed synchronously on start'); }
-  }catch(e){
-    warn('[START] audioCtx.resume failed on start', e);
-  }
-
-  // set UI button disabled if exists
-  const btn = document.getElementById('btnStart');
-  if(btn){ btn.disabled = true; try{ btn.textContent = 'Transmissão: ON'; }catch(e){} }
-  log('[START] Radio starting. initial program:', radioState.currentProgram);
-  // Start loop async (small delay to ensure UI updates)
-  setTimeout(()=>{ sequenceLoopMain().catch(e=>warn('[START] sequenceLoopMain error', e)); }, 10);
-}
-
-/* =================== Touchstart unlock for iOS Safari =================== */
-function unlockAudioContextOnFirstTouch(){
-  if(audioCtx.state === 'suspended'){ audioCtx.resume().then(()=>{ log('[UNLOCK] audioCtx resumed by touchstart'); }).catch(e=>warn('[UNLOCK] resume by touchstart failed', e)); }
-  window.removeEventListener('touchstart', unlockAudioContextOnFirstTouch);
-}
-window.addEventListener('touchstart', unlockAudioContextOnFirstTouch, { once: true });
-
-/* =================== Expose API for index.html =================== */
-window.__RADIO.startRadio = async function(){
-  // ensure this call happens in a direct user gesture whenever possible
-  // resume audioCtx (some browsers require it to be in the click handler)
-  try{ if(audioCtx.state === 'suspended'){ await audioCtx.resume(); log('[API_START] audioCtx resumed in API start'); } }catch(e){ warn('[API_START] audioCtx resume failed', e); }
-  return startRadio();
-};
+window.__RADIO = window.__RADIO || {};
 window.__RADIO.setProgramacao = setProgramacao;
 
-/* =================== Debug helpers =================== */
-window.__RADIO._debug = {
-  audioCtx,
-  audioBufferCache,
-  radioState,
-  sequenceLoopRunning: () => sequenceLoopRunning,
-  getQueues: () => ({ musicQueue: musicQueue.slice(), idQueue: idQueue.slice(), advQueue: advQueue.slice() })
-};
 
-/* =================== Initial log =================== */
-log('renderer.js loaded. Ready. Use window.__RADIO.startRadio() to start (preferably bound to Start button click).');
+/* =================== Initialization & start =================== */
 
+/**
+ * (MODIFICADO) Init
+ * Muito mais leve. Apenas carrega o JSON e o clima.
+ */
+async function init(){
+  await loadDuracoesJSON();
+  await fetchWeather();
+  ativo = PROGRAMACOES[currentProgram];
+  resetMusicQueue();
+  resetIDAdvQueues();
+  log('Init complete — JIT mode v2 ready (program)', currentProgram);
+}
+
+/**
+ * (MODIFICADO) Start Radio
+ * Apenas inicia o loop principal.
+ */
+async function startRadio(){
+  if(started) return;
+  started = true;
+  log('Starting radio (JIT mode v2)');
+
+  if(audioCtx.state === 'suspended') await audioCtx.resume();
+  
+  // Garantir que o init rodou
+  if(Object.keys(duracoesNarracoes).length === 0) {
+    log('Init não rodou, executando agora...');
+    await init();
+  } else {
+    log('Init já concluído.');
+  }
+
+  // Apenas inicia o loop.
+  // O loop vai verificar que 'nextSequenceJob' é nulo
+  // e vai chamar 'prepareNextSequence' pela primeira vez.
+  mainSequenceRunner().catch(e=>console.error('Erro ao iniciar mainSequenceRunner', e));
+}
+
+/* attach start button */
+document.getElementById('btnStart')?.addEventListener('click', startRadio);
+
+/* expose debug controls */
+window.__RADIO.startRadio = startRadio;
+window.__RADIO.loadDuracoesJSON = loadDuracoesJSON;
+window.__RADIO.duracoesNarracoes = () => duracoesNarracoes;
+
+init().catch(e=>console.error('init error', e));
+log('renderer.js loaded (JIT mode v2) — manual start via btnStart');
