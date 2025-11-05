@@ -1,14 +1,19 @@
-// renderer.js — Versão final com preload sequencial, logs detalhados e comportamento de troca de programação robusto
-// - Pré-carrega NEXT somente quando CURRENT começa a tocar
-// - Quando CURRENT termina, toca NEXT (já carregado) e só após iniciar NEXT pré-carrega NEXT+1
-// - Troca de programação pendente (nextProgram) aplicada só no final da sequência atual (respeita últimos 30s regra)
-// - Proteções contra múltiplas instâncias/cliques
-// - Mantém 70% chance pra narração em intro/final e aleatoriedades existentes
-// - Usa duracoes_narracoes.json para validar cabimento das narrações
+// renderer.js - Versão final (completo)
+// - Usa todas as pools/arquivos do renderer original enviado pelo usuário
+// - Pré-carregamento sequencial (current -> preload next when current starts -> wait if next not fully loaded)
+// - Trocas de programação aplicadas only after current sequence ends (respects endto and 30s rule)
+// - Touchstart unlock for iOS + resume on start button click for mobile compatibility
+// - Capas atualizadas when music actually starts
+// - 70% chance for intro and final narrations (as requested)
+// - Detailed logs
 
-/* =================== Setup AudioContext e nodes =================== */
+/* =================== AudioContext / nodes =================== */
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 const audioCtx = new AudioContextClass();
+
+// Expose audioCtx for debug / external resume if needed
+window.__RADIO = window.__RADIO || {};
+window.__RADIO.audioCtx = audioCtx;
 
 const DUCK_TARGET = 0.5;
 const DUCK_DOWN_TIME = 0.1;
@@ -16,32 +21,36 @@ const DUCK_UP_TIME = 0.1;
 const DUCK_RELEASE_DELAY_MS = 200;
 const DEFAULT_COVER = 'capas/default.jpg';
 
+/* Gains */
 const musicGain = audioCtx.createGain(); musicGain.gain.value = 1.0; musicGain.connect(audioCtx.destination);
 const narrationGain = audioCtx.createGain(); narrationGain.connect(audioCtx.destination);
 const analyser = audioCtx.createAnalyser(); analyser.fftSize = 512; analyser.smoothingTimeConstant = 0.85;
 narrationGain.connect(analyser);
 
-/* =================== Estado global e caches =================== */
+/* =================== State & caches =================== */
 const audioBufferCache = new Map(); // path -> AudioBuffer
 let duracoesNarracoes = {};
 let currentCover = DEFAULT_COVER;
 
-/* sequence tokens/state to avoid race conditions */
+/* Sequence & radio control tokens */
 let sequenceLoopRunning = false;
-let sequenceLoopToken = 0; // increment to cancel old loops
+let sequenceLoopToken = 0;
 
-/* radio state (control flags) */
 const radioState = {
-  started: false,           // botão Iniciar já clicado
-  running: false,           // loop rodando
-  currentProgram: 'ivbase', // inicia default como ivbase
-  nextProgram: null,        // programação pedida (pendente)
-  changingProgram: false,   // se há troca pendente
-  preparingNext: false,     // se está pré-carregando a próxima sequência
-  preloadToken: 0           // token para invalidar preloads antigos
+  started: false,           // start button clicked?
+  running: false,           // loop running
+  currentProgram: 'ivbase', // program playing
+  nextProgram: null,        // requested next program
+  changingProgram: false,   // swap is pending
+  preparingNext: false,     // currently preloading next sequence
+  preloadToken: 0           // token to invalidate preloads
 };
 
-/* =================== Utils =================== */
+/* For ducking */
+let activeNarrationsCount = 0;
+let duckReleaseTimeout = null;
+
+/* =================== Utilities =================== */
 function pad(n, len=2){ return String(n).padStart(len, '0'); }
 function rand(arr){ return arr && arr.length ? arr[Math.floor(Math.random()*arr.length)] : null; }
 function chance(p){ return Math.random() < p; }
@@ -55,52 +64,50 @@ function weightedPick(items){
   return items[0].k;
 }
 
-/* =================== Carregamento duracoes json =================== */
+/* =================== Load durations JSON =================== */
 async function loadDuracoesJSON(){
   try{
     const resp = await fetch('duracoes_narracoes.json');
     if(!resp.ok) throw new Error('duracoes json fetch failed ' + resp.status);
     duracoesNarracoes = await resp.json();
-    log('duracoes_narracoes.json carregado. entradas:', Object.keys(duracoesNarracoes).length);
+    log('duracoes_narracoes.json loaded entries:', Object.keys(duracoesNarracoes).length);
   }catch(e){
-    warn('Falha ao carregar duracoes_narracoes.json:', e);
+    warn('Failed to load duracoes_narracoes.json', e);
     duracoesNarracoes = {};
   }
 }
 loadDuracoesJSON();
 
-/* =================== getAudioBuffer (cache) =================== */
+/* =================== getAudioBuffer with cache =================== */
 async function getAudioBuffer(path){
   if(audioBufferCache.has(path)) return audioBufferCache.get(path);
-  log('getAudioBuffer -> fetching', path);
+  log('[GET_BUFFER] fetching', path);
   const resp = await fetch(path);
   if(!resp.ok) throw new Error('fetch ' + resp.status + ' ' + path);
   const ab = await resp.arrayBuffer();
   const buf = await audioCtx.decodeAudioData(ab);
   audioBufferCache.set(path, buf);
-  log('Buffer decodificado e cacheado:', path);
+  log('[GET_BUFFER] decoded & cached', path);
   return buf;
 }
 
-/* =================== Reproduzir buffers =================== */
+/* =================== Playback helpers =================== */
 async function playBufferToDestination(buf){
   return new Promise(resolve => {
     const src = audioCtx.createBufferSource(); src.buffer = buf; src.connect(audioCtx.destination);
-    src.onended = () => { resolve(); };
+    src.onended = () => resolve();
     src.start();
   });
 }
 async function playBufferToNarrationGain(buf){
   return new Promise(resolve => {
     const src = audioCtx.createBufferSource(); src.buffer = buf; src.connect(narrationGain);
-    src.onended = () => { resolve(); };
+    src.onended = () => resolve();
     src.start();
   });
 }
 
-/* =================== Ducking (reduz volume da música durante narração) =================== */
-let activeNarrationsCount = 0;
-let duckReleaseTimeout = null;
+/* =================== Ducking =================== */
 function onNarrationStart(){
   activeNarrationsCount++;
   if(duckReleaseTimeout){ clearTimeout(duckReleaseTimeout); duckReleaseTimeout = null; }
@@ -108,11 +115,11 @@ function onNarrationStart(){
   musicGain.gain.cancelScheduledValues(now);
   musicGain.gain.setValueAtTime(musicGain.gain.value, now);
   musicGain.gain.linearRampToValueAtTime(DUCK_TARGET, now + DUCK_DOWN_TIME);
-  log('Duck iniciado ->', DUCK_TARGET, 'activeNarrationsCount', activeNarrationsCount);
+  log('[DUCK] narration start - duck to', DUCK_TARGET, 'count', activeNarrationsCount);
 }
 function onNarrationEnd(){
   activeNarrationsCount = Math.max(0, activeNarrationsCount-1);
-  log('Narration ended, activeNarrationsCount', activeNarrationsCount);
+  log('[DUCK] narration end - remaining', activeNarrationsCount);
   if(activeNarrationsCount === 0){
     duckReleaseTimeout = setTimeout(() => {
       const now = audioCtx.currentTime;
@@ -120,23 +127,24 @@ function onNarrationEnd(){
       musicGain.gain.setValueAtTime(musicGain.gain.value, now);
       musicGain.gain.linearRampToValueAtTime(1.0, now + DUCK_UP_TIME);
       duckReleaseTimeout = null;
-      log('Duck liberado -> 1.0');
+      log('[DUCK] released to 1.0');
     }, DUCK_RELEASE_DELAY_MS);
   }
 }
 
 /* =================== Cover update =================== */
 function updateCover(src = DEFAULT_COVER, force=false){
-  const el = document.getElementById('capa');
+  const el = document.getElementById('capa') || document.getElementById('cover');
   if(!el) return;
-  if(force || el.src.indexOf(src) === -1){
-    el.src = src;
-    currentCover = src;
-    log('Capa atualizada ->', src);
+  const target = src || DEFAULT_COVER;
+  if(force || el.src.indexOf(target) === -1){
+    el.src = target;
+    currentCover = target;
+    log('[COVER] set to', target);
   }
 }
 
-/* =================== Weather helpers (reaproveita sua chave) =================== */
+/* =================== Weather helpers =================== */
 let currentWeatherMain = 'Clear';
 async function fetchWeather(){
   try{
@@ -144,14 +152,13 @@ async function fetchWeather(){
     const resp = await fetch(`https://api.openweathermap.org/data/2.5/weather?q=Maringa,BR&appid=${key}`);
     const j = await resp.json();
     currentWeatherMain = j && j.weather && j.weather[0] && j.weather[0].main ? j.weather[0].main : 'Clear';
-    log('Weather atual:', currentWeatherMain);
+    log('[WEATHER] current', currentWeatherMain);
   }catch(e){
-    warn('fetchWeather falhou:', e);
+    warn('[WEATHER] fetch failed', e);
     currentWeatherMain = 'Clear';
   }
 }
 fetchWeather();
-
 function pickWeatherFile(condition){
   if(!condition) return null;
   const c = String(condition).toLowerCase();
@@ -164,7 +171,7 @@ function pickWeatherFile(condition){
   return null;
 }
 
-/* =================== Candidate selection via duracoes_narracoes.json =================== */
+/* =================== Candidate fit using duracoes_narracoes.json =================== */
 function filterCandidatesByZone(candidates, zoneLenMs){
   if(!candidates || candidates.length===0) return [];
   const out = [];
@@ -181,10 +188,8 @@ function chooseRandomCandidateThatFits(poolPaths, zoneLenMs){
   return filtered[Math.floor(Math.random()*filtered.length)];
 }
 
-/* =================== Pools & programações (copiado do renderer original) =================== */
-/* Aqui eu copiei as listas e pools do seu renderer original para manter compatibilidade.
-   Se quiser editar os pools, edite as arrays abaixo. */
-
+/* =================== Pools (copied from original renderer) =================== */
+/* base musicasList */
 const base_musicasList = [
   { id:'fascination', name:'FASCINATION', arquivo:'musicas/FASCINATION.wav', introStart:5581, introEnd:27563, finalStart:188733, finalEnd:216000, capa:'capas/fascination.jpg' },
   { id:'remedy', name:'REMEDY', arquivo:'musicas/REMEDY.wav', introStart:6020, introEnd:36138, finalStart:195886, finalEnd:222205, capa:'capas/remedy.jpg' },
@@ -243,7 +248,7 @@ const base_musicIntroNarrations = {
   'TURNYOUINSIDEOUT': ['narracoes/TURNYOUINSIDEOUT_01.wav']
 };
 
-/* TLAD / IVTLAD pools (copiados) */
+/* TLAD / IVTLAD pools copied similarly */
 const tlad_musicasList = [
   { id:'chinagrove_ph', name:'CHINAGROVE_PH', arquivo:'musicas/CHINAGROVE_PH.wav', introStart:6316, introEnd:21472, finalStart:140333, finalEnd:173642, capa:'capas/chinagrove_ph.jpg' },
   { id:'deadoralive_ph', name:'DEADORALIVE_PH', arquivo:'musicas/DEADORALIVE_PH.wav', introStart:15000, introEnd:38946, finalStart:255000, finalEnd:282684, capa:'capas/deadoralive_ph.jpg' },
@@ -358,7 +363,7 @@ const PROGRAMACOES = {
   }
 };
 
-/* =================== Filas aleatórias (shuffle) =================== */
+/* =================== Queues (shuffle) =================== */
 let musicQueue = [];
 let idQueue = [];
 let advQueue = [];
@@ -370,11 +375,10 @@ async function nextMusic(){ if(!musicQueue || musicQueue.length===0) resetMusicQ
 async function nextID(){ if(!idQueue || idQueue.length===0) resetIDAdvQueues(); return idQueue.shift(); }
 async function nextAdv(){ if(!advQueue || advQueue.length===0) resetIDAdvQueues(); return advQueue.shift(); }
 
-/* =================== Build concrete sequence (respeita 70% chance e ENDTO) =================== */
+/* =================== Build concrete sequence (with 70% narration chances) =================== */
 async function buildConcreteSequenceForProgram(programKey, overrideEndto=null){
   const prog = PROGRAMACOES[programKey];
   if(!prog) return null;
-  // weighted pool similar to original
   const sequencePool = [
     {k:'id+musica', w:3},
     {k:'djsolo+musica', w:3},
@@ -384,16 +388,13 @@ async function buildConcreteSequenceForProgram(programKey, overrideEndto=null){
     {k:'id+djsolo+musica', w:1}
   ];
   const seqKey = weightedPick(sequencePool);
-  const seq = { seqKey, parts: [], endtoRequest: null };
+  const seq = { seqKey, parts: [], endtoRequest: null, programKey };
+
   const pickFrom = (pool) => pool && pool.length ? pool[Math.floor(Math.random()*pool.length)] : null;
 
-  // build in order (like previous implementation)
   if(seqKey.startsWith('adv')){
-    const adv = await nextAdv();
-    if(adv) seq.parts.push({type:'adv', path:adv});
-    if(seqKey === 'adv+id+musica'){
-      const id2 = await nextID(); if(id2) seq.parts.push({type:'id', path:id2});
-    }
+    const adv = await nextAdv(); if(adv) seq.parts.push({type:'adv', path:adv});
+    if(seqKey === 'adv+id+musica'){ const id2 = await nextID(); if(id2) seq.parts.push({type:'id', path:id2}); }
   } else if(seqKey.startsWith('id')){
     const id = await nextID(); if(id) seq.parts.push({type:'id', path:id});
   } else if(seqKey === 'djsolo+musica'){
@@ -404,7 +405,6 @@ async function buildConcreteSequenceForProgram(programKey, overrideEndto=null){
     const d = pickFrom(prog.grupoDJSolo || []); if(d) seq.parts.push({type:'djsolo', path:d});
   }
 
-  // music part
   if(seqKey.includes('musica')){
     const musicObj = await nextMusic();
     if(musicObj){
@@ -453,14 +453,11 @@ async function buildConcreteSequenceForProgram(programKey, overrideEndto=null){
   }
 
   if(overrideEndto) seq.endtoRequest = overrideEndto;
-  log('buildConcreteSequenceForProgram ->', programKey, 'seqKey', seq.seqKey, 'parts', seq.parts.map(p=>p.type));
+  log('[BUILD_SEQ] built', seq.seqKey, 'program', programKey, 'parts', seq.parts.map(p=>p.type));
   return seq;
 }
 
-/* =================== Preload EXATO da sequence (sem priorização) ===================
-   Este preload NÃO é iniciado até a sequência atual começar a tocar (por design do usuário).
-   Usa token de preload para invalidar resultados antigos.
-*/
+/* =================== Preload exact files for sequence =================== */
 async function preloadExactSequence(sequence, preloadToken){
   if(!sequence) return {loaded:[]};
   const files = new Set();
@@ -475,60 +472,58 @@ async function preloadExactSequence(sequence, preloadToken){
   if(sequence.endtoRequest === 'towheather'){
     const wf = pickWeatherFile(currentWeatherMain); if(wf) files.add(wf);
   }
-
   const list = Array.from(files);
-  log('[PRELOAD] token', preloadToken, '-> iniciando preload de', list.length, 'arquivos:', list);
+  log('[PRELOAD] token', preloadToken, '-> starting preload', list.length, 'files');
   for(const f of list){
-    if(preloadToken !== radioState.preloadToken){ log('[PRELOAD] token stale, abortando preload atual:', preloadToken); throw new Error('preload_token_stale'); }
-    if(audioBufferCache.has(f)){ log('[PRELOAD] já no cache:', f); continue; }
+    if(preloadToken !== radioState.preloadToken){ log('[PRELOAD] token stale, abort preload', preloadToken); throw new Error('preload_token_stale'); }
+    if(audioBufferCache.has(f)){ log('[PRELOAD] already cached', f); continue; }
     try{
       await getAudioBuffer(f);
-      log('[PRELOAD] carregado:', f);
+      log('[PRELOAD] loaded', f);
     }catch(e){
-      warn('[PRELOAD] falha ao carregar', f, e);
-      // não interrompe o loop: tentamos carregar todos; se algo faltar, o loop esperará
+      warn('[PRELOAD] failed load', f, e);
+      // continue trying others; caller may wait if necessary
     }
   }
-  log('[PRELOAD] token', preloadToken, '-> preload concluído para sequência');
+  log('[PRELOAD] token', preloadToken, '-> preload finished');
   return {loaded:list};
 }
 
-/* =================== Play prepared sequence (usa buffers no cache) =================== */
+/* =================== Play prepared sequence (uses cached buffers) =================== */
 async function playPreparedSequence(sequence){
   if(!sequence) return;
-  log('[PLAY_SEQUENCE] Iniciando sequência:', sequence.seqKey, 'parts:', sequence.parts.map(p=>p.type));
+  log('[PLAY_SEQ] playing', sequence.seqKey, 'parts', sequence.parts.map(p=>p.type));
   updateCover(DEFAULT_COVER);
 
   for(const part of sequence.parts){
     if(part.type === 'id' || part.type === 'adv' || part.type === 'djsolo' || part.type === 'news' || part.type === 'weather'){
       try{
         const buf = await getAudioBuffer(part.path);
-        log('[PLAY] Tocando', part.type, part.path);
+        log('[PLAY] starting', part.type, part.path);
         await playBufferToDestination(buf);
-        log('[PLAY] Finalizou', part.type, part.path);
+        log('[PLAY] ended', part.type, part.path);
       }catch(e){
-        warn('[PLAY] Erro ao tocar', part.path, e);
+        warn('[PLAY] error', part.path, e);
       }
     } else if(part.type === 'musica'){
       await playMusicWithChosenNarrations(part.music, part.narrations || []);
     }
   }
-  log('[PLAY_SEQUENCE] Sequência finalizada:', sequence.seqKey);
+  log('[PLAY_SEQ] finished', sequence.seqKey);
 }
 
-/* =================== playMusicWithChosenNarrations (schedules narrations já escolhidas) =================== */
+/* =================== Play music with chosen narrations (schedules) =================== */
 async function playMusicWithChosenNarrations(musicObj, narrationList){
   if(!musicObj) return;
-  log('[PLAY_MUSIC] Iniciando música:', musicObj.name, musicObj.arquivo);
+  log('[PLAY_MUSIC] starting', musicObj.name, musicObj.arquivo);
+  // Update cover immediately when music starts
   updateCover(musicObj.capa || DEFAULT_COVER, true);
 
   const musicBuf = await getAudioBuffer(musicObj.arquivo);
-  const musicSrc = audioCtx.createBufferSource();
-  musicSrc.buffer = musicBuf;
-  musicSrc.connect(musicGain);
+  const src = audioCtx.createBufferSource(); src.buffer = musicBuf; src.connect(musicGain);
   const startAudioTime = audioCtx.currentTime;
-  musicSrc.start(startAudioTime);
-  log('[PLAY_MUSIC] music started at audioTime', startAudioTime.toFixed(3), 'track', musicObj.name);
+  src.start(startAudioTime);
+  log('[PLAY_MUSIC] started at audioTime', startAudioTime.toFixed(3), 'track', musicObj.name);
 
   const scheduledPromises = [];
   let endtoScheduled = false;
@@ -551,19 +546,16 @@ async function playMusicWithChosenNarrations(musicObj, narrationList){
     }
   }
 
-  // Wait for music to end
-  await new Promise(resolve => musicSrc.onended = resolve);
-  log('[PLAY_MUSIC] música terminou:', musicObj.name);
+  await new Promise(resolve => src.onended = resolve);
+  log('[PLAY_MUSIC] track ended', musicObj.name);
 
-  // Wait for scheduled narrations to finish if still running
   if(scheduledPromises.length > 0){
-    try{ await Promise.all(scheduledPromises); }catch(e){ warn('[PLAY_MUSIC] erro aguardando narracoes', e); }
+    try{ await Promise.all(scheduledPromises); }catch(e){ warn('[PLAY_MUSIC] waiting narrs error', e); }
   }
 
-  // If had ENDTO, handle followup (this may call runSequenceImmediately and such)
+  // If had ENDTO final narration that queued a followup, handle it
   if(endtoScheduled && endtoSubgroup){
-    log('[ENDTO] endtoScheduled tipo', endtoSubgroup);
-    // note: handleEndtoFollowupQueued will use current PROGRAMACOES pools (respecting any nextProgram applied when sequence finished)
+    log('[ENDTO] queued', endtoSubgroup);
     await handleEndtoFollowupQueued(endtoSubgroup);
   }
 
@@ -583,7 +575,6 @@ async function scheduleNarrationToEndAt(musicStartAudioTime, zoneStartMs, zoneEn
     const src = audioCtx.createBufferSource();
     src.buffer = buf; src.connect(narrationGain);
 
-    // schedule duck lead
     const now = audioCtx.currentTime;
     const leadMs = 40;
     const duckDelayMs = Math.max(0, (startAudioTime - now) * 1000 - leadMs);
@@ -598,18 +589,18 @@ async function scheduleNarrationToEndAt(musicStartAudioTime, zoneStartMs, zoneEn
     const p = new Promise(resolve => {
       src.onended = () => { onNarrationEnd(); resolve({path:candidatePath, meta}); };
     });
-    log('[SCHEDULE_NARR] scheduled', candidatePath, 'startAudioTime', startAudioTime.toFixed(3));
+    log('[SCHEDULE] narration scheduled', candidatePath, 'startAudioTime', startAudioTime.toFixed(3));
     return {scheduled:true, promise:p, chosen:candidatePath, dur:durMs, meta};
   }catch(e){
-    warn('[SCHEDULE_NARR] failed', candidatePath, e);
+    warn('[SCHEDULE] failed to schedule', candidatePath, e);
     return {scheduled:false};
   }
 }
 
-/* =================== ENDTO followup handler (simple behaviors) =================== */
+/* =================== handleEndtoFollowupQueued =================== */
 async function handleEndtoFollowupQueued(subgroup){
   if(!subgroup) return;
-  log('[ENDTO_FOLLOWUP] executing subgroup', subgroup, 'program now', radioState.currentProgram);
+  log('[ENDTO_FOLLOWUP] handling', subgroup, 'currentProgram', radioState.currentProgram);
   updateCover(DEFAULT_COVER);
   const prog = PROGRAMACOES[radioState.currentProgram];
 
@@ -630,7 +621,7 @@ async function handleEndtoFollowupQueued(subgroup){
   }
 }
 
-/* play narration immediate */
+/* =================== playNarrationImmediate & runSequenceImmediately =================== */
 async function playNarrationImmediate(path){
   try{
     const buf = await getAudioBuffer(path);
@@ -642,14 +633,12 @@ async function playNarrationImmediate(path){
   }
 }
 
-/* runSequenceImmediately fallback (used by ENDTO flows) */
 async function runSequenceImmediately(seq){
-  log('[RUN_IMMEDIATE] ', seq, 'program', radioState.currentProgram);
-  const prog = PROGRAMACOES[radioState.currentProgram];
+  log('[RUN_IMMEDIATE]', seq, 'program', radioState.currentProgram);
   switch(seq){
     case 'adv+musica': {
-      const adv = await nextAdv(); if(adv) { await playBufferToDestination(await getAudioBuffer(adv)); }
-      const m = await nextMusic(); if(m) { await playMusicWithChosenNarrations(m, []); }
+      const adv = await nextAdv(); if(adv) await playBufferToDestination(await getAudioBuffer(adv));
+      const m = await nextMusic(); if(m) await playMusicWithChosenNarrations(m, []);
       break;
     }
     case 'adv+id+musica': {
@@ -678,11 +667,12 @@ async function runSequenceImmediately(seq){
       const m = await nextMusic(); if(m) await playMusicWithChosenNarrations(m, []);
       break;
     }
-    default: warn('[RUN_IMMEDIATE] unknown sequence', seq);
+    default:
+      warn('[RUN_IMMEDIATE] unknown', seq);
   }
 }
 
-/* =================== Prune cache: mantém apenas arquivos necessários para current e next sequence =================== */
+/* =================== pruneCacheKeepSequences =================== */
 function pruneCacheKeepSequences(currentSeq, nextSeq){
   try{
     const keep = new Set();
@@ -698,205 +688,71 @@ function pruneCacheKeepSequences(currentSeq, nextSeq){
       }
     };
     addSeq(currentSeq); addSeq(nextSeq);
-    // limpar tudo que não está no keep
     for(const k of Array.from(audioBufferCache.keys())){
-      if(!keep.has(k)){ audioBufferCache.delete(k); log('[PRUNE] Removed from cache:', k); }
+      if(!keep.has(k)){ audioBufferCache.delete(k); log('[PRUNE] removed', k); }
     }
   }catch(e){
-    warn('[PRUNE] erro', e);
+    warn('[PRUNE] error', e);
   }
 }
 
-/* =================== Loop principal (sequencial) ===================
-   - Quando a loop inicia, constrói preparedCurrent (previamente já construído no início)
-   - Ao INICIAR preparedCurrent (inicio de reprodução), dispara preload do NEXT (apenas enquanto current toca)
-   - Ao finalizar current:
-       - se next não carregado -> espera até carregar (per your requirement: wait, don't play partial)
-       - se nextProgram pendente e aplicável -> use nextProgram para construir next sequence antes de tocar next
-       - toca next (já carregado)
-   - Após iniciar next, inicia preload do nextNext, e o ciclo segue
-*/
-async function sequenceLoopMain(){
-  if(sequenceLoopRunning) { log('[LOOP] Já existe um loop rodando. Ignorando nova chamada.'); return; }
-  sequenceLoopRunning = true;
-  sequenceLoopToken++; const myToken = sequenceLoopToken;
-  radioState.running = true;
-  log('[LOOP] sequenceLoopMain iniciado. token', myToken, 'program inicial', radioState.currentProgram);
-
-  // inicializar filas para a programação atual
-  resetMusicQueue(); resetIDAdvQueues();
-
-  try{
-    // prepare primeira sequência (mas NÃO iniciar preload do next ainda até que a sequência COMEÇE a tocar)
-    let preparedCurrent = await buildConcreteSequenceForProgram(radioState.currentProgram, null);
-    log('[LOOP] preparedCurrent construída:', preparedCurrent ? preparedCurrent.seqKey : 'NULL');
-
-    // Preload for the preparedCurrent BEFORE starting to play it (we must have current available)
-    radioState.preloadToken++;
-    const currentPreloadToken = radioState.preloadToken;
-    try{
-      log('[LOOP] Carregando arquivos da preparedCurrent antes de tocar (token)', currentPreloadToken);
-      await preloadExactSequence(preparedCurrent, currentPreloadToken);
-    }catch(e){
-      if(String(e).includes('preload_token_stale')) { log('[LOOP] preload cancelled for preparedCurrent (token stale)'); sequenceLoopRunning=false; radioState.running=false; return; }
-      else warn('[LOOP] Erro carregando preparedCurrent', e);
-    }
-
-    // Now start the loop
-    let preparedNext = null;
-    let nextPreloadPromise = null;
-
-    while(sequenceLoopToken === myToken){
-      // 1) Start playing preparedCurrent. When it starts, we will start preloading preparedNext.
-      log('[LOOP] Iniciando reprodução de preparedCurrent:', preparedCurrent.seqKey);
-      // start pre-build of preparedNext (but DO NOT preload yet — we'll preload only when current actually starts)
-      // Build preparedNext based on current preparedCurrent.endtoRequest (so respects ENDTO)
-      preparedNext = await buildConcreteSequenceForProgram(radioState.nextProgram || radioState.currentProgram, preparedCurrent.endtoRequest || null);
-      log('[LOOP] preparedNext construída (pronta para preload após current start):', preparedNext ? preparedNext.seqKey : 'NULL');
-
-      // Play current in background, but we need to start preloading next AS SOON AS playback begins.
-      // We'll implement playPreparedSequence that returns a promise resolving after fully finished.
-      // To coordinate: before calling playPreparedSequence we set up a microtask to start preload after small delay (when audioCtx actually starts)
-      // Simpler: call playPreparedSequence but start preloadExactSequence immediately after a small setTimeout(0) — the audio already started in playPreparedSequence.
-      // To ensure preload begins "while current plays", we'll start it right after playPreparedSequence returns an internal "started" signal.
-      // So we will modify playPreparedSequence to optionally fire an event "onStarted" — but for simplicity, wrap: call playPreparedSequenceStart which returns {playPromise, startedPromise}.
-      const playStarter = startPlayingPreparedSequenceWithStartSignal(preparedCurrent);
-      // Wait until playback has actually started (ensures we begin preloading while it's playing)
-      await playStarter.startedPromise;
-      log('[LOOP] confirmed preparedCurrent started -> iniciando preload da preparedNext (token)', radioState.preloadToken+1);
-      // start preload for preparedNext now (only once)
-      radioState.preloadToken++;
-      const preloadTokenForNext = radioState.preloadToken;
-      radioState.preparingNext = true;
-      nextPreloadPromise = preloadExactSequence(preparedNext, preloadTokenForNext).catch(err => {
-        if(String(err).includes('preload_token_stale')) { log('[LOOP] next preload cancelled (token stale)'); }
-        else warn('[LOOP] next preload failed', err);
-      }).finally(()=>{ radioState.preparingNext = false; });
-      // Now wait for the full playPromise (current completes)
-      await playStarter.playPromise;
-      log('[LOOP] preparedCurrent finished playback');
-
-      // At this point, we must decide whether to apply program change:
-      // If user has requested a nextProgram different from current, we apply it now before starting preparedNext,
-      // except special rule: if change requested <30s left of the music when requested, we accept latest change but we start loading only after next sequence begins (we implemented by postponing preload start).
-      // We need to check radioState.nextProgram vs radioState.currentProgram.
-      if(radioState.nextProgram && radioState.nextProgram !== radioState.currentProgram){
-        log('[LOOP] Aplicando troca de programação pendente. nextProgram=', radioState.nextProgram, 'old currentProgram=', radioState.currentProgram);
-        // apply now: set currentProgram to nextProgram
-        radioState.currentProgram = radioState.nextProgram;
-        radioState.nextProgram = null;
-        radioState.changingProgram = false;
-        // rebuild queues for the new program
-        resetMusicQueue(); resetIDAdvQueues();
-        // IMPORTANT: preparedNext was built earlier in loop using (radioState.nextProgram || radioState.currentProgram).
-        // We must ensure preparedNext corresponds to the program we want to play next.
-        // If preparedNext was built for old program, we should rebuild preparedNext for the new program.
-        // So: if preparedNext.programKey differs, rebuild.
-        // But we built preparedNext using radioState.nextProgram || radioState.currentProgram at build time; to be safe, rebuild preparedNext now.
-        log('[LOOP] Rebuilding preparedNext para a nova programação aplicada');
-        preparedNext = await buildConcreteSequenceForProgram(radioState.currentProgram, preparedCurrent.endtoRequest || null);
-        // Start its preload (we may have preloaded previous preparedNext — we will prune caches soon)
-        radioState.preloadToken++;
-        const newPreloadToken = radioState.preloadToken;
-        try{ await preloadExactSequence(preparedNext, newPreloadToken); }catch(e){ if(String(e).includes('preload_token_stale')) log('[LOOP] preload aborted token stale'); else warn('[LOOP] preload erro ao rebuild preparedNext', e); }
-      } else {
-        // No program change applied: ensure preparedNext preload finished (if not, wait)
-        if(nextPreloadPromise){
-          log('[LOOP] aguardando preload da preparedNext completar antes de tocar (se necessário)');
-          try{ await nextPreloadPromise; }catch(e){ /* já logado */ }
-        } else {
-          log('[LOOP] nextPreloadPromise não iniciado? (isso não deveria ocorrer)');
-        }
-      }
-
-      // Before starting preparedNext, prune cache to keep only current/next
-      pruneCacheKeepSequences(preparedCurrent, preparedNext);
-
-      // Rotate: preparedCurrent = preparedNext; then null preparedNext for next iteration
-      preparedCurrent = preparedNext;
-      preparedNext = null;
-
-      // Start playing preparedCurrent (i.e., the one we preloaded). But per requested behavior, we must START its playback immediately in next loop iteration.
-      // However, loop continues — since while loop will restart, we'll build new preparedNext then start its preload only after current starts.
-      // Continue loop.
-      // But we must check token still valid
-      if(sequenceLoopToken !== myToken){
-        log('[LOOP] token changed, saindo loop');
-        break;
-      }
-    } // end while
-  }catch(e){
-    warn('[LOOP] erro inesperado no sequenceLoopMain', e);
-  }finally{
-    sequenceLoopRunning = false;
-    radioState.running = false;
-    log('[LOOP] sequenceLoopMain finalizado');
-  }
-}
-
-/* Helper que inicia a reprodução e retorna: { startedPromise, playPromise }.
-   startedPromise resolve assim que a música/parte realmente começou (microtask), playPromise resolve quando tudo da sequência terminar.
+/* =================== Helper: startPlayingPreparedSequenceWithStartSignal =================== */
+/* Plays sequence inline but returns two promises:
+   - startedPromise resolves as soon as first audio actually starts
+   - playPromise resolves when whole sequence finishes
+   Also ensures cover updated when a music part starts playing.
 */
 function startPlayingPreparedSequenceWithStartSignal(sequence){
   const startedDeferred = {};
   const playDeferred = {};
-
   startedDeferred.promise = new Promise(resolve => { startedDeferred.resolve = resolve; });
   playDeferred.promise = new Promise(resolve => { playDeferred.resolve = resolve; });
 
-  // We will play sequence in microtasks and signal started as soon as the first audio node starts.
   (async () => {
     try{
-      log('[PLAY_STARTER] iniciando execução de sequência e coletando sinal de "started"');
-      // We'll instrument playPreparedSequence to emit an event when first sound starts.
-      // Simpler: implement small inline player here to detect first start.
+      log('[PLAY_STARTER] starting sequence inline', sequence.seqKey);
       let firstStarted = false;
-      // iterate parts
       for(const part of sequence.parts){
         if(part.type === 'id' || part.type === 'adv' || part.type === 'djsolo' || part.type === 'news' || part.type === 'weather'){
           try{
             const buf = await getAudioBuffer(part.path);
-            // create source
             const src = audioCtx.createBufferSource(); src.buffer = buf; src.connect(audioCtx.destination);
-            if(!firstStarted){ firstStarted = true; startedDeferred.resolve(); log('[PLAY_STARTER] primeira parte começou:', part.type, part.path); }
+            if(!firstStarted){ firstStarted = true; startedDeferred.resolve(); log('[PLAY_STARTER] first part started', part.type, part.path); }
             await new Promise(res => { src.onended = res; src.start(); });
-            log('[PLAY_STARTER] parte finalizada:', part.type, part.path);
+            log('[PLAY_STARTER] part ended', part.type, part.path);
           }catch(e){
-            warn('[PLAY_STARTER] erro tocando parte', part, e);
+            warn('[PLAY_STARTER] error playing part', part, e);
           }
         } else if(part.type === 'musica'){
-          // music: schedule narrations and detect start
           try{
+            // update cover before starting actual music
+            updateCover(part.music.capa || DEFAULT_COVER, true);
             const musicBuf = await getAudioBuffer(part.path);
             const src = audioCtx.createBufferSource(); src.buffer = musicBuf; src.connect(musicGain);
             const startTime = audioCtx.currentTime;
             src.start(startTime);
-            if(!firstStarted){ firstStarted = true; startedDeferred.resolve(); log('[PLAY_STARTER] musica começou:', part.music.name); }
+            if(!firstStarted){ firstStarted = true; startedDeferred.resolve(); log('[PLAY_STARTER] music started', part.music.name); }
             // schedule narrations
             const scheduled = [];
             for(const nar of (part.narrations || [])){
               if(nar.when === 'intro'){
-                const zoneStartMs = part.music.introStart;
-                const zoneEndMs = part.music.introEnd;
-                const res = await scheduleNarrationToEndAt(startTime, zoneStartMs, zoneEndMs, nar.path, nar.dur, {when:'intro'});
+                const res = await scheduleNarrationToEndAt(startTime, part.music.introStart, part.music.introEnd, nar.path, nar.dur, {when:'intro'});
                 if(res.scheduled) scheduled.push(res.promise);
               } else if(nar.when === 'final'){
-                const zoneStartMs = part.music.finalStart;
-                const zoneEndMs = part.music.finalEnd;
-                const res = await scheduleNarrationToEndAt(startTime, zoneStartMs, zoneEndMs, nar.path, nar.dur, {when:'final', subgroup:nar.subgroup});
+                const res = await scheduleNarrationToEndAt(startTime, part.music.finalStart, part.music.finalEnd, nar.path, nar.dur, {when:'final', subgroup:nar.subgroup});
                 if(res.scheduled) scheduled.push(res.promise);
               }
             }
             await new Promise(res => { src.onended = res; });
-            log('[PLAY_STARTER] musica terminou:', part.music.name);
-            if(scheduled.length) try{ await Promise.all(scheduled); }catch(e){ warn('[PLAY_STARTER] erro aguardando narrs', e); }
+            log('[PLAY_STARTER] music ended', part.music.name);
+            if(scheduled.length) try{ await Promise.all(scheduled); }catch(e){ warn('[PLAY_STARTER] waiting narrs error', e); }
           }catch(e){
-            warn('[PLAY_STARTER] erro tocando musica', e);
+            warn('[PLAY_STARTER] error during music part', e);
           }
         }
       }
     }catch(e){
-      warn('[PLAY_STARTER] erro no player inline', e);
+      warn('[PLAY_STARTER] inline player error', e);
     }finally{
       playDeferred.resolve();
     }
@@ -905,68 +761,178 @@ function startPlayingPreparedSequenceWithStartSignal(sequence){
   return { startedPromise: startedDeferred.promise, playPromise: playDeferred.promise };
 }
 
-/* =================== setProgramacao (chamada pelas thumbs) ===================
-   - Antes de startRadio: muda currentProgram somente (não inicia preloads)
-   - Depois de startRadio: registra nextProgram pendente; se igual ao currentProgram (ou igual ao already pending) ignora.
-*/
+/* =================== sequenceLoopMain - core loop implementing requested behavior =================== */
+async function sequenceLoopMain(){
+  if(sequenceLoopRunning){ log('[LOOP] already running, ignoring'); return; }
+  sequenceLoopRunning = true;
+  sequenceLoopToken++; const myToken = sequenceLoopToken;
+  radioState.running = true;
+  log('[LOOP] started token', myToken, 'initial program', radioState.currentProgram);
+
+  // ensure queues for current program
+  resetMusicQueue(); resetIDAdvQueues();
+
+  try{
+    // Build initial preparedCurrent
+    let preparedCurrent = await buildConcreteSequenceForProgram(radioState.currentProgram, null);
+    log('[LOOP] preparedCurrent built', preparedCurrent ? preparedCurrent.seqKey : 'NULL');
+
+    // preload preparedCurrent (we need current to be playable before starting)
+    radioState.preloadToken++;
+    const firstPreloadToken = radioState.preloadToken;
+    try{
+      log('[LOOP] preloading preparedCurrent files token', firstPreloadToken);
+      await preloadExactSequence(preparedCurrent, firstPreloadToken);
+    }catch(e){
+      if(String(e).includes('preload_token_stale')){ log('[LOOP] initial preload aborted token stale'); sequenceLoopRunning=false; radioState.running=false; return; }
+      else warn('[LOOP] error preloading initial preparedCurrent', e);
+    }
+
+    let preparedNext = null;
+    let nextPreloadPromise = null;
+
+    while(sequenceLoopToken === myToken){
+      // Build preparedNext now (so it can reflect ENDTO of preparedCurrent)
+      preparedNext = await buildConcreteSequenceForProgram(radioState.nextProgram || radioState.currentProgram, preparedCurrent.endtoRequest || null);
+      log('[LOOP] preparedNext built', preparedNext ? preparedNext.seqKey : 'NULL');
+
+      // Start playing preparedCurrent and start preload of preparedNext only when preparedCurrent actually starts
+      const playStarter = startPlayingPreparedSequenceWithStartSignal(preparedCurrent);
+      // Wait for startedPromise to ensure playback actually began (and thus mobile contexts are unlocked)
+      await playStarter.startedPromise;
+      log('[LOOP] preparedCurrent has started playback; starting preload for preparedNext');
+
+      // Start preload for preparedNext
+      radioState.preloadToken++;
+      const preloadTokenForNext = radioState.preloadToken;
+      radioState.preparingNext = true;
+      nextPreloadPromise = preloadExactSequence(preparedNext, preloadTokenForNext).catch(err => {
+        if(String(err).includes('preload_token_stale')) log('[LOOP] next preload cancelled token stale');
+        else warn('[LOOP] next preload failed', err);
+      }).finally(()=>{ radioState.preparingNext = false; });
+
+      // Wait for the full playPromise (preparedCurrent to end)
+      await playStarter.playPromise;
+      log('[LOOP] preparedCurrent playback finished');
+
+      // Decide whether to apply pending program change
+      // Apply pending change now (after current ended) if exists
+      if(radioState.nextProgram && radioState.nextProgram !== radioState.currentProgram){
+        log('[LOOP] applying pending program change ->', radioState.nextProgram, 'old', radioState.currentProgram);
+        radioState.currentProgram = radioState.nextProgram;
+        radioState.nextProgram = null;
+        radioState.changingProgram = false;
+        // rebuild queues for new program
+        resetMusicQueue(); resetIDAdvQueues();
+        // Rebuild preparedNext to reflect new program (if preparedNext was built for old program)
+        preparedNext = await buildConcreteSequenceForProgram(radioState.currentProgram, preparedCurrent.endtoRequest || null);
+        // Preload preparedNext now (ensure ready)
+        radioState.preloadToken++;
+        const newPreloadToken = radioState.preloadToken;
+        try{ await preloadExactSequence(preparedNext, newPreloadToken); }catch(e){ if(String(e).includes('preload_token_stale')) log('[LOOP] rebuild preload canceled'); else warn('[LOOP] rebuild preload failed', e); }
+      } else {
+        // No program change; ensure preparedNext preload finished
+        if(nextPreloadPromise){
+          log('[LOOP] waiting for preparedNext preload to finish before playing it');
+          try{ await nextPreloadPromise; }catch(e){ /* already logged */ }
+        } else {
+          log('[LOOP] nextPreloadPromise missing - this is unexpected');
+        }
+      }
+
+      // prune cache to keep only current-next
+      pruneCacheKeepSequences(preparedCurrent, preparedNext);
+
+      // rotate: current <- next
+      preparedCurrent = preparedNext;
+      preparedNext = null;
+
+      // go next iteration: preparedCurrent is ready (preloaded) and will be played on loop start
+      if(sequenceLoopToken !== myToken){
+        log('[LOOP] token changed, exiting loop');
+        break;
+      }
+    } // end while
+  }catch(e){
+    warn('[LOOP] error in sequenceLoopMain', e);
+  }finally{
+    sequenceLoopRunning = false;
+    radioState.running = false;
+    log('[LOOP] sequenceLoopMain finished');
+  }
+}
+
+/* =================== setProgramacao (handles clicks) =================== */
 function setProgramacao(key){
-  if(!PROGRAMACOES[key]) { warn('setProgramacao: programa desconhecido', key); return; }
+  if(!PROGRAMACOES[key]){ warn('[SET_PROGRAM] unknown program', key); return; }
   if(!radioState.started){
     radioState.currentProgram = key;
     radioState.nextProgram = null;
     radioState.changingProgram = false;
-    log('[SET_PROGRAM] Antes de iniciar rádio -> programacao atual agora é', key);
-    // update UI active thumb
+    log('[SET_PROGRAM] before start -> currentProgram set to', key);
     return;
   }
-  // after started: handle pending switch logic
-  // If the clicked program is the same as currentProgram -> ignore
+  // after started: if clicked same as current -> ignore
   if(key === radioState.currentProgram){
-    log('[SET_PROGRAM] clicado na programação atual (ignorar):', key);
-    // If there was a pending nextProgram equal to currentProgram (i.e. user canceled), clear it
-    if(radioState.nextProgram && radioState.nextProgram !== radioState.currentProgram) { /* do nothing */ }
+    log('[SET_PROGRAM] clicked current program -> ignore', key);
+    // if there is a pending nextProgram that equals current, clear? by spec we keep current playing
     return;
   }
-  // If clicked program is same as pending nextProgram -> ignore
-  if(radioState.nextProgram === key){
-    log('[SET_PROGRAM] clicado na programação que já está pendente (ignorar):', key);
+  // clicked program equals pending nextProgram -> ignore
+  if(key === radioState.nextProgram){
+    log('[SET_PROGRAM] clicked program already pending -> ignore', key);
     return;
   }
-  // If clicked program equals the program that is currently loading as next? We track via radioState.preparingNext if needed.
-  // Set it as pending; the loop will apply it at end of current sequence.
-  log('[SET_PROGRAM] registrando troca pendente ->', key, ' (vai aplicar quando a sequência atual terminar)');
+  // else set as nextProgram (replace any previous pending)
+  log('[SET_PROGRAM] setting pending nextProgram ->', key);
   radioState.nextProgram = key;
   radioState.changingProgram = true;
 }
 
-/* =================== startRadio (botão) =================== */
+/* =================== startRadio (must be called from a user gesture) =================== */
 async function startRadio(){
-  if(radioState.started){
-    log('[START] Rádio já iniciada. Ignorando novo start.');
-    return;
-  }
+  if(radioState.started){ log('[START] already started -> ignoring'); return; }
   radioState.started = true;
-  // ensure initial program default is ivbase (unless user selected before)
-  if(!radioState.currentProgram) radioState.currentProgram = 'ivbase';
-  log('[START] Iniciando rádio. Programacao inicial:', radioState.currentProgram);
-  // disable start button visually (if exists)
-  const btn = document.getElementById('btnStart'); if(btn) { btn.disabled = true; btn.textContent = 'Rádio em transmissão'; }
-  // set up UI program thumbs to call setProgramacao (they already do in index.html)
-  // Start the sequence loop (single instance)
-  setTimeout(()=>{ sequenceLoopMain().catch(e=>warn('[START] sequenceLoopMain erro', e)); }, 20);
+  // attempt to resume AudioContext immediately (important for mobile)
+  try{
+    if(audioCtx.state === 'suspended'){ await audioCtx.resume(); log('[START] audioCtx resumed synchronously on start'); }
+  }catch(e){
+    warn('[START] audioCtx.resume failed on start', e);
+  }
+
+  // set UI button disabled if exists
+  const btn = document.getElementById('btnStart');
+  if(btn){ btn.disabled = true; try{ btn.textContent = 'Transmissão: ON'; }catch(e){} }
+  log('[START] Radio starting. initial program:', radioState.currentProgram);
+  // Start loop async (small delay to ensure UI updates)
+  setTimeout(()=>{ sequenceLoopMain().catch(e=>warn('[START] sequenceLoopMain error', e)); }, 10);
 }
 
-/* Expose API for index.html */
-window.__RADIO = window.__RADIO || {};
-window.__RADIO.startRadio = startRadio;
+/* =================== Touchstart unlock for iOS Safari =================== */
+function unlockAudioContextOnFirstTouch(){
+  if(audioCtx.state === 'suspended'){ audioCtx.resume().then(()=>{ log('[UNLOCK] audioCtx resumed by touchstart'); }).catch(e=>warn('[UNLOCK] resume by touchstart failed', e)); }
+  window.removeEventListener('touchstart', unlockAudioContextOnFirstTouch);
+}
+window.addEventListener('touchstart', unlockAudioContextOnFirstTouch, { once: true });
+
+/* =================== Expose API for index.html =================== */
+window.__RADIO.startRadio = async function(){
+  // ensure this call happens in a direct user gesture whenever possible
+  // resume audioCtx (some browsers require it to be in the click handler)
+  try{ if(audioCtx.state === 'suspended'){ await audioCtx.resume(); log('[API_START] audioCtx resumed in API start'); } }catch(e){ warn('[API_START] audioCtx resume failed', e); }
+  return startRadio();
+};
 window.__RADIO.setProgramacao = setProgramacao;
 
-/* Expose debug helpers */
+/* =================== Debug helpers =================== */
 window.__RADIO._debug = {
   audioCtx,
   audioBufferCache,
   radioState,
-  sequenceLoopRunning: () => sequenceLoopRunning
+  sequenceLoopRunning: () => sequenceLoopRunning,
+  getQueues: () => ({ musicQueue: musicQueue.slice(), idQueue: idQueue.slice(), advQueue: advQueue.slice() })
 };
 
-log('renderer.js carregado. Pronto para iniciar a rádio. Botão "Iniciar Rádio" deve ser o gatilho.');
+/* =================== Initial log =================== */
+log('renderer.js loaded. Ready. Use window.__RADIO.startRadio() to start (preferably bound to Start button click).');
+
